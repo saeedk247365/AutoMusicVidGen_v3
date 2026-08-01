@@ -1,0 +1,29 @@
+{
+  "comfyUrl": "http://127.0.0.1:8888",
+  "comfyRoot": "ComfyUI",
+  "datasetDir": "dataset/adam/images",
+  "checkpoint": "realcartoon3d_v15.safetensors",
+
+  "loraName": "adamboy_character_v2",
+  "datasetFolder": "character_lora_adamboy",
+
+  "steps": 200,
+  "learningRate": 0.0005,
+  "rank": 8,
+  "batchSize": 1,
+  "gradAccumulationSteps": 8,
+  "seed": 999301,
+  "optimizer": "AdamW",
+  "lossFunction": "MSE",
+  "trainingDtype": "bf16",
+  "loraDtype": "bf16",
+  "algorithm": "LoRA",
+  "gradientCheckpointing": true,
+  "checkpointDepth": 2,
+  "offloading": false,
+  "bypassMode": false,
+  "existingLora": "[None]",
+
+  "copyToModelsLoras": true,
+  "copyToProject": true
+}
