@@ -79,15 +79,19 @@ Kids-hit animate seeds Wan from the **previous clip’s end frame** when the sto
 
 Same-room clips **blend** the previous end-frame with the next keyframe (~82% end / ~18% still; ~55/45 on cast change) so Mom can enter/exit without a hard cut, while pose stays continuous.
 
+When chaining, Wan also gets **FLF2V** (`end_image` = this beat’s keyframe) and the first ~3 frames are trimmed (overlap morph). Stitch applies a **0.2s micro-crossfade** between same-room clips (`--loop-fill`).
+
+Planning keeps Mom on for **3–4 consecutive same-room beats**, prefers **fewer/longer clips** (12–16 beats), and **locks one resized plate per room** so only cutouts change.
+
 End frames live under `clips/_continuity/<stem>_end.png`.
 
-Opt out with `--no-frame-chain` (or setup `noFrameChain: true`) if you want every clip from its authored still.
+Opt out: `--no-frame-chain`, `--no-flf`, `--no-overlap-trim`, `--no-crossfade`.
 
 Classic animate (no `--kids-hit`) is unchanged — always keyframe → Wan.
 
 ### Why keyframes still look different
 
-Keyframes are still **authored storyboards** (pose / cast layout per beat). Chaining uses them as a *hint* via blend, not as a hard Wan restart when the room continues. The gallery will still show different stills — the video should not snap to them.
+Keyframes are still **authored storyboards** (pose / cast layout per beat). Chaining uses them as a *hint* via blend + FLF, not as a hard Wan restart when the room continues. The gallery will still show different stills — the video should not snap to them.
 
 ## Golden example
 

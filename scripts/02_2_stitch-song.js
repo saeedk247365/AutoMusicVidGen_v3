@@ -120,13 +120,15 @@ async function loadActions(songDir) {
   }
 }
 
-function beatWindowForClip(clipPath, actions) {
+function beatForClip(clipPath, actions) {
   const stem = basename(clipPath, ".mp4");
-  // Composite naming: NN_beatId
   const m = /^(\d+)_(.+)$/i.exec(stem);
   if (!m || !actions?.beats) return null;
-  const beatId = m[2];
-  const beat = actions.beats.find((b) => b.id === beatId);
+  return actions.beats.find((b) => b.id === m[2]) || null;
+}
+
+function beatWindowForClip(clipPath, actions) {
+  const beat = beatForClip(clipPath, actions);
   if (!beat) return null;
   if (
     Number.isFinite(Number(beat.startSec)) &&
@@ -135,6 +137,103 @@ function beatWindowForClip(clipPath, actions) {
     return { startSec: Number(beat.startSec), endSec: Number(beat.endSec) };
   }
   return null;
+}
+
+/**
+ * Concat clips with a short crossfade when consecutive beats share a room.
+ * Hard-cuts on room/bridge changes. fadeSec ~4–6 frames @ 16–24fps.
+ */
+async function concatWithMicroCrossfade(
+  clipPaths,
+  outPath,
+  actions,
+  { fadeSec = 0.2, locationSources = null } = {},
+) {
+  if (clipPaths.length === 1) {
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-i",
+        clipPaths[0],
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        outPath,
+      ],
+      { windowsHide: true, maxBuffer: 32 * 1024 * 1024 },
+    );
+    return { fades: 0 };
+  }
+
+  const durs = [];
+  for (const p of clipPaths) durs.push(await ffprobeDuration(p));
+  const locPaths = locationSources || clipPaths;
+  const locs = locPaths.map((p) => {
+    const b = beatForClip(p, actions);
+    return String(b?.location || "").toLowerCase();
+  });
+  const bridges = locPaths.map((p) => !!beatForClip(p, actions)?.bridge);
+
+  const args = ["-y"];
+  for (const p of clipPaths) args.push("-i", p);
+
+  const filters = [];
+  // Normalize each input to a common size/fps label
+  for (let i = 0; i < clipPaths.length; i++) {
+    filters.push(
+      `[${i}:v]fps=16,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[v${i}]`,
+    );
+  }
+
+  let last = "v0";
+  let acc = durs[0];
+  let fades = 0;
+  for (let i = 1; i < clipPaths.length; i++) {
+    const sameRoom =
+      locs[i] &&
+      locs[i - 1] &&
+      locs[i] === locs[i - 1] &&
+      !bridges[i] &&
+      !bridges[i - 1];
+    const canFade =
+      sameRoom &&
+      durs[i - 1] > fadeSec + 0.08 &&
+      durs[i] > fadeSec + 0.08;
+    const out = i === clipPaths.length - 1 ? "vout" : `vx${i}`;
+    if (canFade) {
+      const offset = Math.max(0, acc - fadeSec);
+      filters.push(
+        `[${last}][v${i}]xfade=transition=fade:duration=${fadeSec.toFixed(3)}:offset=${offset.toFixed(3)}[${out}]`,
+      );
+      acc = acc + durs[i] - fadeSec;
+      fades += 1;
+    } else {
+      filters.push(`[${last}][v${i}]concat=n=2:v=1:a=0[${out}]`);
+      acc = acc + durs[i];
+    }
+    last = out;
+  }
+
+  args.push(
+    "-filter_complex",
+    filters.join(";"),
+    "-map",
+    "[vout]",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-an",
+    outPath,
+  );
+  await execFileAsync("ffmpeg", args, {
+    windowsHide: true,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return { fades };
 }
 
 async function stitchSong(songDir) {
@@ -154,6 +253,8 @@ async function stitchSong(songDir) {
   let listBody;
   let loopCounts = null;
   let mode = "concat-tpad";
+  /** @type {string[]} */
+  let concatInputs = clips;
 
   if (loopFill) {
     mode = "loop-fill";
@@ -224,6 +325,7 @@ async function stitchSong(songDir) {
       segmentFiles.push(outSeg);
     }
 
+    concatInputs = segmentFiles;
     listBody = segmentFiles
       .map((c) => `file '${ffmpegEscapePath(resolve(c))}'`)
       .join("\n");
@@ -237,26 +339,66 @@ async function stitchSong(songDir) {
   await writeFile(listPath, listBody, "utf8");
 
   const silentPath = join(workDir, "silent.mp4");
-  console.log(`  concat…`);
-  await execFileAsync(
-    "ffmpeg",
-    [
-      "-y",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      listPath,
-      "-c:v",
-      "libx264",
-      "-pix_fmt",
-      "yuv420p",
-      "-an",
-      silentPath,
-    ],
-    { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
-  );
+  const useXfade =
+    (loopFill || has("--crossfade")) && !has("--no-crossfade");
+  if (useXfade) {
+    const actions = await loadActions(songDir);
+    console.log(`  concat + micro-crossfade (same-room)…`);
+    try {
+      const { fades } = await concatWithMicroCrossfade(
+        concatInputs,
+        silentPath,
+        actions,
+        { fadeSec: 0.2, locationSources: clips },
+      );
+      console.log(`  crossfades applied: ${fades}`);
+      mode = `${mode}+xfade`;
+    } catch (err) {
+      console.warn(
+        `  crossfade failed (${err?.message || err}) — falling back to hard concat`,
+      );
+      await execFileAsync(
+        "ffmpeg",
+        [
+          "-y",
+          "-f",
+          "concat",
+          "-safe",
+          "0",
+          "-i",
+          listPath,
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          "-an",
+          silentPath,
+        ],
+        { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      );
+    }
+  } else {
+    console.log(`  concat…`);
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        listPath,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        silentPath,
+      ],
+      { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+    );
+  }
 
   let videoDur = await ffprobeDuration(silentPath);
   console.log(`  video=${videoDur.toFixed(2)}s  audio=${audioDur.toFixed(2)}s`);

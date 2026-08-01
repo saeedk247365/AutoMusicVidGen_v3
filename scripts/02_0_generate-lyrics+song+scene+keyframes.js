@@ -1665,6 +1665,8 @@ async function generateSongKeyframes(
   await mkdir(keyframesDir, { recursive: true });
   await mkdir(platesDir, { recursive: true });
   await mkdir(cutoutsDir, { recursive: true });
+  /** @type {Map<string, string>} locationId → locked canvas-sized plate path */
+  let lockedPlates = new Map();
 
   // Copy shared empty scene stills into this song folder (never rewritten later)
   for (const scene of scenePack.scenes) {
@@ -1966,11 +1968,17 @@ async function generateSongKeyframes(
 
     const canvasW = SETTINGS.stillWidth;
     const canvasH = SETTINGS.stillHeight;
-    const sceneSized = join(scenesDir, `_${location}_${pad}_sized.png`);
-    await sharp(scenePath)
-      .resize(canvasW, canvasH, { fit: "cover" })
-      .png()
-      .toFile(sceneSized);
+    // Shared plate lock: one cover-crop per location for the whole song
+    let sceneSized = lockedPlates.get(location);
+    if (!sceneSized) {
+      sceneSized = join(scenesDir, `_locked_${location}.png`);
+      await sharp(scenePath)
+        .resize(canvasW, canvasH, { fit: "cover", position: "centre" })
+        .png()
+        .toFile(sceneSized);
+      lockedPlates.set(location, sceneSized);
+      console.log(`      plate-lock ${location} → ${sceneSized}`);
+    }
 
     console.log(
       `      composite ${layers.length} layer(s) → ${fname}` +
@@ -1990,11 +1998,6 @@ async function generateSongKeyframes(
         beat.proximity || (beat.closeInteraction ? "close" : "apart"),
     });
     await writeFile(dest, finalBuf);
-    try {
-      await unlink(sceneSized);
-    } catch {
-      /* ignore */
-    }
     console.log(`  saved: ${dest}`);
   }
   if (onlySet) {

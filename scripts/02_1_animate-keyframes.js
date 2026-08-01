@@ -67,8 +67,8 @@ function songArgPath(songDir) {
 const MOTION_NEGATIVE =
   "blurry, low quality, morphing face, extra limbs, distorted hands, text, watermark, photorealistic, sudden cut, flicker, outfit change, clothing morph, different clothes, hat, beanie, cap, bag, purse, handbag, glasses, accessories, white t-shirt on mom, pink pants on mom, coral blouse missing, mint shirt change, navy pants change, three people, second child, extra person, twin, kiss, kissing, hug, hugging, embrace, snuggle, cuddle, wrapping arms, holding child, fused bodies, morphing bodies, extra arms, claw hands";
 
-function wanI2VWorkflow(cfg, imageName, motionPrompt, negative, seed) {
-  return {
+function wanI2VWorkflow(cfg, imageName, motionPrompt, negative, seed, endImageName = null) {
+  const wf = {
     "1": {
       class_type: "CLIPLoader",
       inputs: {
@@ -154,6 +154,28 @@ function wanI2VWorkflow(cfg, imageName, motionPrompt, negative, seed) {
         batch_size: 1,
       },
     },
+  };
+
+  // FLF2V: guide motion toward the next authored keyframe when chaining
+  if (endImageName) {
+    wf["11b"] = {
+      class_type: "LoadImage",
+      inputs: { image: endImageName },
+    };
+    wf["12b"] = {
+      class_type: "ImageScale",
+      inputs: {
+        image: ["11b", 0],
+        upscale_method: "lanczos",
+        width: cfg.width,
+        height: cfg.height,
+        crop: "center",
+      },
+    };
+    wf["13"].inputs.end_image = ["12b", 0];
+  }
+
+  Object.assign(wf, {
     "14": {
       class_type: "KSamplerAdvanced",
       inputs: {
@@ -207,7 +229,9 @@ function wanI2VWorkflow(cfg, imageName, motionPrompt, negative, seed) {
         codec: "h264",
       },
     },
-  };
+  });
+
+  return wf;
 }
 
 async function findNewestVideo(prefix, comfyUrl) {
@@ -550,6 +574,38 @@ async function blendChainStart(endPath, keyframePath, outPath, endWeight = 0.72)
   return outPath;
 }
 
+/** Drop the first N frames (Wan morph) in-place. */
+async function trimLeadingFrames(mp4Path, frames = 3, fps = 16) {
+  const dur = await ffprobeDuration(mp4Path);
+  const skip = Math.max(0, (Number(frames) || 0) / Math.max(1, Number(fps) || 16));
+  if (!(dur > skip + 0.2)) return false;
+  const tmp = `${mp4Path}.trim.mp4`;
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+      "-ss",
+      skip.toFixed(3),
+      "-i",
+      mp4Path,
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-an",
+      tmp,
+    ],
+    { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+  );
+  await copyFile(tmp, mp4Path);
+  try {
+    await unlink(tmp);
+  } catch {
+    /* ignore */
+  }
+  return true;
+}
+
 async function animateSong(
   songDir,
   cfg,
@@ -729,6 +785,20 @@ async function animateSong(
       ? `family_chain_${stem}.png`
       : `family_kf_${stem}.png`;
     const uploaded = await uploadImage(comfyUrl, uploadName, buf);
+    let endUploadedName = null;
+    // FLF2V: when chaining, guide toward this beat's authored keyframe
+    if (chainedFrom && existsSync(src) && !has("--no-flf")) {
+      try {
+        const endUp = await uploadImage(
+          comfyUrl,
+          `family_flf_${stem}.png`,
+          await readFile(src),
+        );
+        endUploadedName = endUp.name;
+      } catch (err) {
+        console.warn(`      FLF end-image upload skipped: ${err?.message || err}`);
+      }
+    }
     const seed = flag("--seed")
       ? Number(flag("--seed")) + n
       : (Date.now() + n * 17) >>> 0;
@@ -741,6 +811,7 @@ async function animateSong(
         motion,
         MOTION_NEGATIVE,
         seed,
+        endUploadedName,
       ),
       900000,
       stem,
@@ -779,6 +850,15 @@ async function animateSong(
     }
     if (!comfySource || !existsSync(dest)) {
       throw new Error(`No Wan output found for ${stem} (prefix ${outName})`);
+    }
+    // Drop first ~3 frames of chained clips (Wan morph into motion)
+    if (chainedFrom && !has("--no-overlap-trim")) {
+      try {
+        const trimmed = await trimLeadingFrames(dest, 3, clipCfg.fps || 16);
+        if (trimmed) console.log(`      overlap-trim first 3 frames`);
+      } catch (err) {
+        console.warn(`      overlap-trim skipped: ${err?.message || err}`);
+      }
     }
     console.log(`      → ${dest}`);
 
