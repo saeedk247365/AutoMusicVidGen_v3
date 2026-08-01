@@ -786,15 +786,41 @@ async function animateSong(
       : `family_kf_${stem}.png`;
     const uploaded = await uploadImage(comfyUrl, uploadName, buf);
     let endUploadedName = null;
-    // FLF2V: when chaining, guide toward this beat's authored keyframe
-    if (chainedFrom && existsSync(src) && !has("--no-flf")) {
+    // FLF2V: camera-end crop (or keyframe) so Wan pushes/pans toward end framing
+    if (kidsHit && !has("--no-flf")) {
       try {
-        const endUp = await uploadImage(
-          comfyUrl,
-          `family_flf_${stem}.png`,
-          await readFile(src),
-        );
-        endUploadedName = endUp.name;
+        const parsed = parseKeyframeName(stem);
+        const camCandidates = [];
+        if (parsed.beatId) {
+          camCandidates.push(
+            join(
+              keyframesDir,
+              "_camera",
+              `${parsed.index}_${parsed.beatId}_end.png`,
+            ),
+          );
+        }
+        camCandidates.push(join(keyframesDir, "_camera", `${stem}_end.png`));
+        let endSrc = null;
+        for (const p of camCandidates) {
+          if (existsSync(p)) {
+            endSrc = p;
+            break;
+          }
+        }
+        // Fallback: only when chaining, use authored keyframe as soft end guide
+        if (!endSrc && chainedFrom && existsSync(src)) endSrc = src;
+        if (endSrc) {
+          const endUp = await uploadImage(
+            comfyUrl,
+            `family_flf_${stem}.png`,
+            await readFile(endSrc),
+          );
+          endUploadedName = endUp.name;
+          console.log(
+            `      FLF end ← ${endSrc.includes("_camera") ? "camera-end" : "keyframe"}`,
+          );
+        }
       } catch (err) {
         console.warn(`      FLF end-image upload skipped: ${err?.message || err}`);
       }

@@ -60,6 +60,7 @@ import {
   STUDIO_BG_NEGATIVE,
   removePlateBackground,
   resolveCharacterLayout,
+  extractCameraCrop,
 } from "../lib/composite.js";
 import {
   HOME_THEMES,
@@ -88,6 +89,12 @@ import {
   repairKidsHitBeats,
   objectiveForTheme,
   validateContinuity,
+  buildMusicMap,
+  writeMusicMap,
+  loadMusicMap,
+  CAMERA_PLATE_OVERSIZE,
+  cameraCropRect,
+  ensureCameraShotCard,
 } from "../lib/kids-hit.js";
 import {
   ensureOllamaRunning,
@@ -1268,6 +1275,7 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
       allowedLocations,
       durationSec: dur,
       lyricsText: opts.lyricsText || "",
+      musicMap: opts.musicMap || null,
     });
     result.durationSec = dur;
     result.kidsHit = true;
@@ -1530,6 +1538,49 @@ async function assertHealthyAudio(path) {
   console.log(`Audio levels: mean=${mean} dB  max=${max} dB`);
 }
 
+async function probeAudioDuration(path) {
+  try {
+    const { stdout } = await execFileAsync(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+      ],
+      { windowsHide: true },
+    );
+    const d = Number(String(stdout).trim());
+    return Number.isFinite(d) && d > 0 ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureSongMusicMap(songDir, { bpm, durationSec, mp3Path } = {}) {
+  let dur = Number(durationSec) || 0;
+  const audio =
+    mp3Path ||
+    (await readdir(songDir)).map((f) => join(songDir, f)).find((p) => /\.mp3$/i.test(p));
+  if (!(dur > 0) && audio && existsSync(audio)) {
+    dur = (await probeAudioDuration(audio)) || 0;
+  }
+  if (!(dur > 0)) dur = KIDS_HIT_DURATION_SEC;
+  const map = buildMusicMap({
+    durationSec: dur,
+    bpm: Number(bpm) || SETTINGS.bpm || 115,
+    source: "ace-bpm-grid",
+  });
+  const path = await writeMusicMap(songDir, map);
+  console.log(
+    `  music-map: ${map.bpm}bpm · ${map.beats.length} beats → ${path}`,
+  );
+  return map;
+}
+
 async function freeComfyVram(comfyUrl) {
   try {
     await comfy(comfyUrl, "/free", {
@@ -1683,11 +1734,34 @@ async function generateSongKeyframes(
   } catch {
     /* optional */
   }
+  let musicMap = null;
+  if (kidsHit || plan?.kidsHit === true) {
+    musicMap = await loadMusicMap(songDir);
+    if (!musicMap) {
+      try {
+        const metaPath = join(songDir, "kids-hit-meta.json");
+        let bpm = SETTINGS.bpm;
+        let dur = plan?.durationSec || KIDS_HIT_DURATION_SEC;
+        if (existsSync(metaPath)) {
+          const meta = JSON.parse(stripBom(await readFile(metaPath, "utf8")));
+          if (meta.bpm) bpm = meta.bpm;
+          if (meta.durationSec) dur = meta.durationSec;
+        }
+        musicMap = await ensureSongMusicMap(songDir, {
+          bpm,
+          durationSec: dur,
+        });
+      } catch (err) {
+        console.warn(`  music-map skipped: ${err?.message || err}`);
+      }
+    }
+  }
   const planNorm = normalizeBeatPlan(plan, allowedLocations, {
     kidsHit: kidsHit || plan?.kidsHit === true,
     durationSec: plan?.durationSec,
     theme: plan?.theme || "",
     lyricsText,
+    musicMap,
   });
   await writeFile(
     join(scenesDir, "actions.json"),
@@ -1827,12 +1901,15 @@ async function generateSongKeyframes(
 
       const layout = resolveCharacterLayout({
         location,
-        camera: beat.camera,
+        camera:
+          beat.cameraFraming ||
+          (typeof beat.camera === "string" ? beat.camera : null) ||
+          "medium_full",
         pose: "stand",
         slot: "center",
         depth: "near",
         role: "toddler",
-        cameraMotion: beat.cameraMotion || "",
+        cameraMotion: beat.cameraMotion || beat.camera?.motion || "",
         proximity: "close",
       });
       // Duo cutout is taller/wider — bump scale so the pair fills mid-frame
@@ -1869,12 +1946,16 @@ async function generateSongKeyframes(
 
       const layout = resolveCharacterLayout({
         location,
-        camera: frame.camera || beat.camera,
+        camera:
+          beat.cameraFraming ||
+          (typeof beat.camera === "string" ? beat.camera : null) ||
+          frame.camera ||
+          "medium_full",
         pose: frame.pose,
         slot: frame.placement || "center",
         depth: beat.depth || frame.depth || "mid",
         role: char.role || "toddler",
-        cameraMotion: beat.cameraMotion || "",
+        cameraMotion: beat.cameraMotion || beat.camera?.motion || "",
         proximity: beat.proximity || (beat.closeInteraction ? "close" : "apart"),
       });
 
@@ -1968,16 +2049,48 @@ async function generateSongKeyframes(
 
     const canvasW = SETTINGS.stillWidth;
     const canvasH = SETTINGS.stillHeight;
-    // Shared plate lock: one cover-crop per location for the whole song
-    let sceneSized = lockedPlates.get(location);
-    if (!sceneSized) {
-      sceneSized = join(scenesDir, `_locked_${location}.png`);
+    const beatCam = kidsHit
+      ? ensureCameraShotCard(beat, { index: k - 1 }).camera
+      : null;
+
+    // Shared oversize plate lock (virtual set for pan/zoom)
+    const plateScale = kidsHit ? CAMERA_PLATE_OVERSIZE : 1;
+    const plateW = Math.round(canvasW * plateScale);
+    const plateH = Math.round(canvasH * plateScale);
+    let platePath = lockedPlates.get(location);
+    if (!platePath) {
+      platePath = join(
+        scenesDir,
+        kidsHit ? `_locked_${location}_set.png` : `_locked_${location}.png`,
+      );
       await sharp(scenePath)
-        .resize(canvasW, canvasH, { fit: "cover", position: "centre" })
+        .resize(plateW, plateH, { fit: "cover", position: "centre" })
         .png()
-        .toFile(sceneSized);
-      lockedPlates.set(location, sceneSized);
-      console.log(`      plate-lock ${location} → ${sceneSized}`);
+        .toFile(platePath);
+      lockedPlates.set(location, platePath);
+      console.log(
+        `      plate-lock ${location} ${plateW}x${plateH} → ${platePath}`,
+      );
+    }
+
+    // Start crop of the room (different position per shot)
+    let sceneForComposite = platePath;
+    if (kidsHit && beatCam) {
+      const rect = cameraCropRect(plateW, plateH, canvasW, canvasH, beatCam, {
+        useEnd: false,
+      });
+      const cropPath = join(scenesDir, `_crop_${pad}_${location}.png`);
+      const cropBuf = await extractCameraCrop(platePath, rect, {
+        width: canvasW,
+        height: canvasH,
+      });
+      await writeFile(cropPath, cropBuf);
+      sceneForComposite = cropPath;
+      console.log(
+        `      camera ${beatCam.shotSize} zoom=${beatCam.zoom.toFixed(2)} ` +
+          `offset=(${beatCam.offset.x.toFixed(2)},${beatCam.offset.y.toFixed(2)}) ` +
+          `motion=${beatCam.motion}`,
+      );
     }
 
     console.log(
@@ -1987,17 +2100,63 @@ async function generateSongKeyframes(
           : ""),
     );
 
-    const finalBuf = await compositeScene(sceneSized, layers, {
+    const finalBuf = await compositeScene(sceneForComposite, layers, {
       width: canvasW,
       height: canvasH,
       removeBg: false,
-      // Opt-in kids-hit polish only — classic composites stay unchanged
       featherEdges: !!kidsHit,
       groundWash: !!kidsHit,
       proximity:
         beat.proximity || (beat.closeInteraction ? "close" : "apart"),
     });
     await writeFile(dest, finalBuf);
+
+    // End-camera still for FLF (Ken Burns crop of the finished keyframe)
+    if (kidsHit && beatCam?.end) {
+      try {
+        const camDir = join(keyframesDir, "_camera");
+        await mkdir(camDir, { recursive: true });
+        const endPath = join(camDir, `${pad}_${beat.id || "beat"}_end.png`);
+        // Re-crop oversize composite path: build oversize composite then crop end
+        // Faster path: zoom/pan the finished keyframe toward end framing
+        const endZoom = Math.max(
+          1.02,
+          Number(beatCam.end.zoom) / Math.max(1.01, Number(beatCam.zoom) || 1),
+        );
+        const dx =
+          (Number(beatCam.end.offset?.x) || 0) - (Number(beatCam.offset?.x) || 0);
+        const dy =
+          (Number(beatCam.end.offset?.y) || 0) - (Number(beatCam.offset?.y) || 0);
+        const meta = await sharp(finalBuf).metadata();
+        const w = meta.width || canvasW;
+        const h = meta.height || canvasH;
+        const cropW = Math.round(w / endZoom);
+        const cropH = Math.round(h / endZoom);
+        const left = Math.round(
+          Math.max(0, Math.min(Math.max(0, w - cropW), (w - cropW) / 2 + dx * w * 0.25)),
+        );
+        const top = Math.round(
+          Math.max(0, Math.min(Math.max(0, h - cropH), (h - cropH) / 2 + dy * h * 0.25)),
+        );
+        await sharp(finalBuf)
+          .extract({ left, top, width: cropW, height: cropH })
+          .resize(canvasW, canvasH, { fit: "fill" })
+          .png()
+          .toFile(endPath);
+        console.log(`      camera-end → ${endPath}`);
+      } catch (err) {
+        console.warn(`      camera-end skipped: ${err?.message || err}`);
+      }
+    }
+
+    // Cleanup ephemeral crop
+    if (sceneForComposite !== platePath) {
+      try {
+        await unlink(sceneForComposite);
+      } catch {
+        /* ignore */
+      }
+    }
     console.log(`  saved: ${dest}`);
   }
   if (onlySet) {
@@ -2179,6 +2338,13 @@ async function main() {
         await freeComfyVram(comfyUrl);
         await runPython(pyArgs, 1800000);
         await assertHealthyAudio(dest);
+        if (kidsHit) {
+          await ensureSongMusicMap(songDir, {
+            bpm: bpmLocal,
+            durationSec: durationLocal,
+            mp3Path: dest,
+          });
+        }
         console.log(`Song ready: ${dest}`);
       }
       if (stopAfter === "song") {
@@ -2619,6 +2785,13 @@ async function main() {
         await runPython(pyArgs, 1800000);
         await assertHealthyAudio(dest);
         entry.file = `${slug}.mp3`;
+        if (kidsHit) {
+          await ensureSongMusicMap(songDir, {
+            bpm,
+            durationSec: duration,
+            mp3Path: dest,
+          });
+        }
       } catch (err) {
         entry.error = String(err.message || err).slice(0, 500);
         entry.stage = "song";

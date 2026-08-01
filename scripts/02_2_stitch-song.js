@@ -34,7 +34,12 @@ import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { parseArgs, stripBom } from "../lib/comfy-client.js";
-import { buildTimedSegmentPlan, buildLoopFillPlan } from "../lib/kids-hit.js";
+import {
+  buildTimedSegmentPlan,
+  buildLoopFillPlan,
+  loadMusicMap,
+  musicalCrossfadeSec,
+} from "../lib/kids-hit.js";
 
 const execFileAsync = promisify(execFile);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -343,13 +348,17 @@ async function stitchSong(songDir) {
     (loopFill || has("--crossfade")) && !has("--no-crossfade");
   if (useXfade) {
     const actions = await loadActions(songDir);
-    console.log(`  concat + micro-crossfade (same-room)…`);
+    const musicMap = await loadMusicMap(songDir);
+    const fadeSec = musicalCrossfadeSec(musicMap, 0.2);
+    console.log(
+      `  concat + micro-crossfade (same-room, ${fadeSec.toFixed(2)}s)…`,
+    );
     try {
       const { fades } = await concatWithMicroCrossfade(
         concatInputs,
         silentPath,
         actions,
-        { fadeSec: 0.2, locationSources: clips },
+        { fadeSec, locationSources: clips },
       );
       console.log(`  crossfades applied: ${fades}`);
       mode = `${mode}+xfade`;

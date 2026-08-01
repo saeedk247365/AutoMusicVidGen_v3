@@ -68,7 +68,17 @@ A preschooler should answer from picture alone:
 - `placement.Adam`: `left` \| `center` \| `right` (still **start**; inherited same-room unless walk/exit)
 - `endPlacement.Adam`: where Wan should finish (matches next still start)
 
-## Wan last-frame chain (hybrid, **on by default** for kids-hit)
+## Camera framing + music sync (kids-hit)
+
+| Feature | Behavior |
+|---------|----------|
+| **Shot cards** | Each beat gets `camera.shotSize` / `offset` / `zoom` / `end` (variety enforced in-room) |
+| **Oversize plate** | Room locked at 1.5× canvas; each beat **crops** a different viewport |
+| **Camera-end still** | `keyframes/_camera/<stem>_end.png` for Wan FLF push/pan |
+| **Music map** | `music-map.json` from ACE BPM grid; beat windows snap to downbeats |
+| **Musical xfade** | Stitch crossfade length ≈ half a beat when map exists |
+
+Legacy `camera` string framing is kept as `cameraFraming` for cutout scale.
 
 Kids-hit animate seeds Wan from the **previous clip’s end frame** when the story stays in the same room. That stops every beat from snapping back to a static keyframe pose.
 
