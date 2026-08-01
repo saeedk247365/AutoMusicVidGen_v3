@@ -21,13 +21,17 @@
  *   --kids-hit       opt-in: energetic motion + default length 81 (classic defaults unchanged)
  *   --energetic-motion   same motion prompts without changing length default
  *   --output-resolution preview|youtube  (Wan size; default preview 768×768; youtube 1920×1088)
+ *   --frame-chain    kids-hit: seed Wan from previous clip end frame (DEFAULT on)
+ *   --no-frame-chain force authored keyframes every clip (disable last-frame chain)
  *
  * Do NOT run while LoRA training is occupying the GPU.
  */
-import { mkdir, readFile, writeFile, readdir, stat, copyFile } from "fs/promises";
+import { mkdir, readFile, writeFile, readdir, stat, copyFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
 import { join, dirname, basename, resolve, extname, relative } from "path";
 import { fileURLToPath } from "url";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import {
   COMFY_ROOT,
   resolveComfyDirs,
@@ -47,11 +51,15 @@ import {
   DEFAULT_OUTPUT_RESOLUTION,
   kidsHitMotionPrompt,
   pickWanLength,
+  shouldChainFromPrevClip,
+  castChangedBetweenBeats,
 } from "../lib/kids-hit.js";
 import { writePreviewMp4 } from "../lib/stitch-preview.js";
+import sharp from "sharp";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { flag, has } = parseArgs();
+const execFileAsync = promisify(execFile);
 
 function songArgPath(songDir) {
   return relative(ROOT, songDir).replace(/\\/g, "/");
@@ -278,7 +286,11 @@ function parseKeyframeName(stem) {
   return { index: m[1], beatId: m[2], charId: null };
 }
 
-function motionPromptFor(stem, actions, { kidsHit = false } = {}) {
+function motionPromptFor(
+  stem,
+  actions,
+  { kidsHit = false, frameChained = false, castChanged = false } = {},
+) {
   const { beatId, charId } = parseKeyframeName(stem);
   const POSE_MOTION = {
     stand: "standing still, tiny breath sway, arms at sides",
@@ -366,6 +378,8 @@ function motionPromptFor(stem, actions, { kidsHit = false } = {}) {
       closeInteraction: !!beat?.closeInteraction,
       cause: beat?.cause || "",
       effect: beat?.effect || "",
+      frameChained: !!frameChained,
+      castChanged: !!castChanged,
     });
   }
 
@@ -402,10 +416,151 @@ function passesOnlyFilter(stem, onlySet) {
   return false;
 }
 
-async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
+function beatForStem(stem, actions) {
+  if (!actions?.beats?.length) return null;
+  const { beatId } = parseKeyframeName(stem);
+  if (!beatId) return null;
+  return actions.beats.find((b) => b.id === beatId) || null;
+}
+
+async function ffprobeDuration(file) {
+  const { stdout } = await execFileAsync(
+    "ffprobe",
+    [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      file,
+    ],
+    { windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
+  );
+  const d = Number(String(stdout).trim());
+  return Number.isFinite(d) ? d : 0;
+}
+
+/** Grab a clean frame near the end (accurate seek after demux). */
+async function extractNearEndFrame(mp4Path, outPng, { padSec = 0.08 } = {}) {
+  const dur = await ffprobeDuration(mp4Path);
+  if (!(dur > 0.05)) {
+    throw new Error(`bad duration for ${mp4Path}`);
+  }
+  const t = Math.max(0, dur - Math.max(0.08, padSec));
+  await mkdir(dirname(outPng), { recursive: true });
+  // -ss after -i is slower but frame-accurate; avoid black/wrong frames
+  await execFileAsync(
+    "ffmpeg",
+    [
+      "-y",
+      "-i",
+      mp4Path,
+      "-ss",
+      t.toFixed(3),
+      "-frames:v",
+      "1",
+      "-update",
+      "1",
+      outPng,
+    ],
+    { windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+  );
+  if (!existsSync(outPng)) {
+    throw new Error(`end-frame not written: ${outPng}`);
+  }
+  return outPng;
+}
+
+function continuityEndPath(clipsDir, stem) {
+  return join(clipsDir, "_continuity", `${stem}_end.png`);
+}
+
+/**
+ * When remaking with --only under frame-chain, also remake subsequent
+ * same-room progressive clips that would seed from the remade ones.
+ */
+function expandOnlyForFrameChain(stems, onlySet, actions) {
+  if (!onlySet || !actions?.beats?.length) return onlySet;
+  const expanded = new Set(onlySet);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (let i = 0; i < stems.length - 1; i++) {
+      if (!passesOnlyFilter(stems[i], expanded)) continue;
+      const prevBeat = beatForStem(stems[i], actions);
+      const nextBeat = beatForStem(stems[i + 1], actions);
+      if (!shouldChainFromPrevClip(prevBeat, nextBeat)) continue;
+      if (!passesOnlyFilter(stems[i + 1], expanded)) {
+        expanded.add(stems[i + 1]);
+        grew = true;
+      }
+    }
+  }
+  return expanded;
+}
+
+async function ensureEndFrame(clipsDir, stem, mp4Path) {
+  const endPath = continuityEndPath(clipsDir, stem);
+  if (existsSync(endPath) && existsSync(mp4Path)) {
+    try {
+      const endStat = await stat(endPath);
+      const clipStat = await stat(mp4Path);
+      if (endStat.mtimeMs >= clipStat.mtimeMs) return endPath;
+    } catch {
+      /* regenerate */
+    }
+  }
+  if (!existsSync(mp4Path)) return null;
+  await extractNearEndFrame(mp4Path, endPath);
+  return endPath;
+}
+
+/**
+ * Blend previous clip end-frame with the next authored keyframe.
+ * Keeps pixel continuity while allowing pose/cast hints from the still.
+ */
+async function blendChainStart(endPath, keyframePath, outPath, endWeight = 0.72) {
+  const endMeta = await sharp(endPath).metadata();
+  const w = endMeta.width;
+  const h = endMeta.height;
+  if (!w || !h) throw new Error(`bad end-frame size: ${endPath}`);
+  const endRaw = await sharp(endPath)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const kfRaw = await sharp(keyframePath)
+    .resize(w, h, { fit: "fill" })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const a = Math.max(0, Math.min(1, Number(endWeight) || 0.72));
+  const b = 1 - a;
+  const out = Buffer.alloc(endRaw.data.length);
+  for (let i = 0; i < endRaw.data.length; i += 4) {
+    out[i] = Math.round(endRaw.data[i] * a + kfRaw.data[i] * b);
+    out[i + 1] = Math.round(endRaw.data[i + 1] * a + kfRaw.data[i + 1] * b);
+    out[i + 2] = Math.round(endRaw.data[i + 2] * a + kfRaw.data[i + 2] * b);
+    out[i + 3] = 255;
+  }
+  await mkdir(dirname(outPath), { recursive: true });
+  await sharp(out, { raw: { width: w, height: h, channels: 4 } })
+    .png()
+    .toFile(outPath);
+  return outPath;
+}
+
+async function animateSong(
+  songDir,
+  cfg,
+  comfyUrl,
+  { kidsHit = false, frameChain = false } = {},
+) {
   const keyframesDir = join(songDir, "keyframes");
   const clipsDir = join(songDir, "clips");
+  const continuityDir = join(clipsDir, "_continuity");
   await mkdir(clipsDir, { recursive: true });
+  if (frameChain) await mkdir(continuityDir, { recursive: true });
 
   const actions = await loadActions(songDir);
   const files = (await readdir(keyframesDir))
@@ -414,15 +569,28 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
     .filter((f) => !/^plates$/i.test(f))
     .sort();
 
+  const stems = files.map((f) => basename(f, extname(f)));
+
   const onlyRaw = flag("--only", null);
-  const onlySet = onlyRaw
+  let onlySet = onlyRaw
     ? new Set(onlyRaw.split(",").map((s) => s.trim()).filter(Boolean))
     : null;
+
+  if (frameChain && onlySet) {
+    const before = onlySet.size;
+    onlySet = expandOnlyForFrameChain(stems, onlySet, actions);
+    if (onlySet.size > before) {
+      console.log(
+        `  frame-chain: --only expanded ${before} → ${onlySet.size} stem(s) (same-room chain)`,
+      );
+    }
+  }
 
   const manifest = {
     songDir,
     createdAt: new Date().toISOString(),
     kidsHit: !!kidsHit,
+    frameChain: !!frameChain,
     wan: {
       width: cfg.width,
       height: cfg.height,
@@ -434,7 +602,11 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
   };
 
   console.log(`\nSong: ${songDir}`);
-  console.log(`Keyframes: ${files.length}${kidsHit ? " (kids-hit motion)" : ""}`);
+  console.log(
+    `Keyframes: ${files.length}` +
+      (kidsHit ? " (kids-hit motion)" : "") +
+      (frameChain ? " [last-frame chain]" : ""),
+  );
 
   if (!files.length) {
     throw new Error(
@@ -444,18 +616,25 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
   }
 
   let n = 0;
-  for (const file of files) {
-    const stem = basename(file, extname(file));
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const file = files[fileIdx];
+    const stem = stems[fileIdx];
     if (!passesOnlyFilter(stem, onlySet)) continue;
     n += 1;
     const src = join(keyframesDir, file);
     const dest = join(clipsDir, `${stem}.mp4`);
-    const motion = motionPromptFor(stem, actions, { kidsHit });
+    const beat = beatForStem(stem, actions);
+    const prevStem = fileIdx > 0 ? stems[fileIdx - 1] : null;
+    const prevBeat = prevStem ? beatForStem(prevStem, actions) : null;
+    const chainFromPrev =
+      frameChain &&
+      prevStem &&
+      shouldChainFromPrevClip(prevBeat, beat);
+    const castChanged =
+      !!prevBeat && !!beat && castChangedBetweenBeats(prevBeat, beat);
 
     let clipCfg = cfg;
     if (kidsHit && !cfg.lengthLocked && actions?.beats) {
-      const { beatId } = parseKeyframeName(stem);
-      const beat = actions.beats.find((b) => b.id === beatId);
       if (
         beat &&
         Number.isFinite(Number(beat.startSec)) &&
@@ -468,17 +647,88 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
     }
 
     if (existsSync(dest) && !has("--force")) {
+      const motion = motionPromptFor(stem, actions, { kidsHit });
       console.log(`  (${n}) ${stem} reuse`);
-      manifest.clips.push({ stem, file: dest, reused: true, motion });
+      let endFrame = null;
+      if (frameChain) {
+        try {
+          endFrame = await ensureEndFrame(clipsDir, stem, dest);
+        } catch (err) {
+          console.warn(
+            `      end-frame extract skipped: ${err?.message || err}`,
+          );
+        }
+      }
+      manifest.clips.push({
+        stem,
+        file: dest,
+        reused: true,
+        motion,
+        chainedFrom: null,
+        endFrame,
+      });
       continue;
     }
 
+    // Resolve Wan start image: prev end frame (hybrid) or authored keyframe
+    let startPath = src;
+    let chainedFrom = null;
+    let blendNote = "";
+    if (chainFromPrev) {
+      const prevMp4 = join(clipsDir, `${prevStem}.mp4`);
+      try {
+        const prevEnd = await ensureEndFrame(clipsDir, prevStem, prevMp4);
+        if (prevEnd && existsSync(prevEnd)) {
+          // Same cast: mostly end-frame. Cast change / big pose hint: blend keyframe in.
+          const endWeight = castChanged ? 0.55 : 0.82;
+          if (endWeight < 0.99) {
+            const blendPath = join(
+              continuityDir,
+              `${stem}_chain_start.png`,
+            );
+            startPath = await blendChainStart(
+              prevEnd,
+              src,
+              blendPath,
+              endWeight,
+            );
+            blendNote = castChanged
+              ? ` blend←kf ${(100 - endWeight * 100).toFixed(0)}% (cast change)`
+              : ` blend←kf ${(100 - endWeight * 100).toFixed(0)}%`;
+          } else {
+            startPath = prevEnd;
+          }
+          chainedFrom = prevStem;
+        } else {
+          console.warn(
+            `      frame-chain: no end frame for ${prevStem} — using keyframe`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `      frame-chain: ${err?.message || err} — using keyframe`,
+        );
+      }
+    }
+
+    const motion = motionPromptFor(stem, actions, {
+      kidsHit,
+      frameChained: !!chainedFrom,
+      castChanged: !!chainedFrom && castChanged,
+    });
+
     const outName = `kf_${stem}_${Date.now().toString(36)}`.replace(/[^\w.-]+/g, "_");
-    console.log(`  (${n}) ${stem} → Wan I2V length=${clipCfg.length}`);
+    console.log(
+      `  (${n}) ${stem} → Wan I2V length=${clipCfg.length}` +
+        (chainedFrom ? ` [chain←${chainedFrom}${blendNote}]` : ""),
+    );
     console.log(`      motion: ${motion.slice(0, 140)}…`);
 
-    const buf = await readFile(src);
-    const uploaded = await uploadImage(comfyUrl, `family_kf_${stem}.png`, buf);
+    const buf = await readFile(startPath);
+    const uploadName = chainedFrom
+      ? `family_chain_${stem}.png`
+      : `family_kf_${stem}.png`;
+    const uploaded = await uploadImage(comfyUrl, uploadName, buf);
     const seed = flag("--seed")
       ? Number(flag("--seed")) + n
       : (Date.now() + n * 17) >>> 0;
@@ -531,6 +781,46 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
       throw new Error(`No Wan output found for ${stem} (prefix ${outName})`);
     }
     console.log(`      → ${dest}`);
+
+    let endFrame = null;
+    if (frameChain) {
+      try {
+        endFrame = await extractNearEndFrame(
+          dest,
+          continuityEndPath(clipsDir, stem),
+        );
+        console.log(`      end-frame → ${endFrame}`);
+      } catch (err) {
+        console.warn(`      end-frame extract failed: ${err?.message || err}`);
+      }
+    }
+
+    // If this remake breaks a later chain link outside expanded only-set, warn
+    if (frameChain && onlyRaw && fileIdx < stems.length - 1) {
+      const nextStem = stems[fileIdx + 1];
+      const nextBeat = beatForStem(nextStem, actions);
+      if (
+        shouldChainFromPrevClip(beat, nextBeat) &&
+        !passesOnlyFilter(nextStem, onlySet)
+      ) {
+        console.warn(
+          `      warning: ${nextStem} would chain from ${stem} but is outside --only — remake it or drop --only`,
+        );
+        const nextMp4 = join(clipsDir, `${nextStem}.mp4`);
+        const nextEnd = continuityEndPath(clipsDir, nextStem);
+        for (const dirty of [nextMp4, nextEnd]) {
+          if (existsSync(dirty)) {
+            try {
+              await unlink(dirty);
+              console.warn(`      marked dirty: ${dirty}`);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }
+
     manifest.clips.push({
       stem,
       file: dest,
@@ -539,6 +829,9 @@ async function animateSong(songDir, cfg, comfyUrl, { kidsHit = false } = {}) {
       seed,
       length: clipCfg.length,
       comfySource,
+      chainedFrom,
+      startImage: chainedFrom ? startPath : src,
+      endFrame,
     });
 
     // Progressive preview: concat finished clips + song audio so far
@@ -570,6 +863,8 @@ async function main() {
   }
 
   const kidsHit = has("--kids-hit") || has("--energetic-motion");
+  // Kids-hit defaults to last-frame chain; --no-frame-chain forces keyframe seeds.
+  const frameChain = !!kidsHit && !has("--no-frame-chain");
   const lengthExplicit = has("--length");
   let length = 49;
   if (has("--kids-hit") && !lengthExplicit) {
@@ -615,7 +910,8 @@ async function main() {
   console.log("02_1 Animate keyframes — Wan 2.2 I2V");
   console.log(
     `  ${cfg.width}x${cfg.height} length=${cfg.length} fps=${cfg.fps} steps=${cfg.steps}` +
-      (kidsHit ? " [kids-hit/energetic]" : ""),
+      (kidsHit ? " [kids-hit/energetic]" : "") +
+      (frameChain ? " [frame-chain]" : has("--no-frame-chain") ? " [no-frame-chain]" : ""),
   );
   console.log(`  Comfy: ${comfyUrl}`);
 
@@ -628,7 +924,7 @@ async function main() {
 
   const targets = await listSongDirs(songArg || batchArg);
   for (const songDir of targets) {
-    await animateSong(songDir, cfg, comfyUrl, { kidsHit });
+    await animateSong(songDir, cfg, comfyUrl, { kidsHit, frameChain });
   }
 
   console.log("\n────────────────────────────────────────────────────────");

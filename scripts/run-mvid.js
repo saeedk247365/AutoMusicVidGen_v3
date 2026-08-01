@@ -131,6 +131,14 @@ async function main() {
     extraArgs: passthroughArgs(),
     viewOnly: !songArg && !forceNew && !forceContinue,
   });
+  if (has("--frame-chain")) {
+    orchestrator.setup.frameChain = true;
+  }
+  if (has("--no-frame-chain")) {
+    orchestrator.setup.noFrameChain = true;
+    orchestrator.setup.frameChain = false;
+  }
+  await orchestrator.hydrateSetupFromDisk();
 
   const { listen } = createMvidServer(orchestrator, { port });
   const { url } = await listen();

@@ -24,6 +24,10 @@ import { fileURLToPath } from "url";
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
 import { parseArgs, stripBom, comfy, sleep } from "../lib/comfy-client.js";
+import {
+  ensureOllamaRunning,
+  DEFAULT_OLLAMA_URL,
+} from "../lib/ensure-ollama.js";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -34,7 +38,7 @@ const ACE_ROOT =
 const ACE_PYTHON = join(ACE_ROOT, ".venv", "Scripts", "python.exe");
 const ACE_SCRIPT = join(ROOT, "pipelines", "ace-generate-song.py");
 const NURSERY_DIR = join(ROOT, "batches", "nursery");
-const OLLAMA_URL = "http://127.0.0.1:11434";
+const OLLAMA_URL = DEFAULT_OLLAMA_URL;
 
 // ─── Edit these ─────────────────────────────────────────────────────────────
 
@@ -506,13 +510,8 @@ async function main() {
   );
   console.log(`output: ${NURSERY_DIR}`);
 
-  // Smoke-check Ollama
-  try {
-    const tags = await fetch(`${OLLAMA_URL}/api/tags`);
-    if (!tags.ok) throw new Error(`status ${tags.status}`);
-  } catch (err) {
-    throw new Error(`Ollama not reachable at ${OLLAMA_URL}: ${err.message || err}`);
-  }
+  // Smoke-check Ollama (auto-start if needed)
+  await ensureOllamaRunning(OLLAMA_URL);
 
   await freeComfyVram(comfyUrl);
 

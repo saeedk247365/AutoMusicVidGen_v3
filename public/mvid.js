@@ -25,6 +25,8 @@
 
   let activeTab = "setup";
   let setupLoaded = false;
+  let setupScenesCache = [];
+  let setupSaveTimer = null;
 
   function log(msg) {
     const line = document.createElement("div");
@@ -44,15 +46,93 @@
       (el) => el.value,
     );
     const locationIds = [
-      ...document.querySelectorAll("#setupScenesList input[type=checkbox]:checked"),
-    ].map((el) => el.value);
+      ...document.querySelectorAll("#setupScenesList .room-card.is-on"),
+    ].map((el) => el.dataset.id);
     return {
       castIds,
       locationIds,
+      locationsExplicit: true,
       title: $("setupTitle")?.value?.trim() || "",
       objective: $("setupObjective")?.value?.trim() || "",
       theme: $("setupTheme")?.value?.trim() || "",
     };
+  }
+
+  function updateRoomsCount() {
+    const el = $("roomsCount");
+    if (!el) return;
+    const on = document.querySelectorAll("#setupScenesList .room-card.is-on").length;
+    const total = document.querySelectorAll("#setupScenesList .room-card").length;
+    el.textContent = total ? `${on} / ${total} selected` : "";
+  }
+
+  function renderRoomCards(scenes, selectedIds, { explicit }) {
+    const locEl = $("setupScenesList");
+    if (!locEl) return;
+    const sel = new Set(selectedIds || []);
+    locEl.className = "room-grid";
+    locEl.innerHTML = (scenes || [])
+      .map((s) => {
+        const on = explicit ? sel.has(s.id) : true;
+        return `<button type="button" class="room-card ${on ? "is-on" : "is-off"}" data-id="${esc(s.id)}" aria-pressed="${on}">
+          ${
+            s.thumbUrl
+              ? `<img src="${esc(s.thumbUrl)}" alt="" loading="lazy" />`
+              : `<div class="room-ph">No preview</div>`
+          }
+          <span class="room-meta">
+            <span class="room-name">${esc(s.name || s.id)}</span>
+            <span class="room-mark" aria-hidden="true">✓</span>
+          </span>
+        </button>`;
+      })
+      .join("");
+    updateRoomsCount();
+  }
+
+  function scheduleSetupSave() {
+    clearTimeout(setupSaveTimer);
+    setupSaveTimer = setTimeout(() => {
+      persistSetupDraft();
+    }, 250);
+  }
+
+  async function persistSetupDraft() {
+    const payload = collectSetupPayload();
+    if (!payload.castIds.length) {
+      // Keep previous cast if user briefly unchecked everyone while toggling
+      payload.castIds = state.setup?.castIds?.length
+        ? state.setup.castIds
+        : ["adam", "sasha"];
+    }
+    state.setup = { ...(state.setup || {}), ...payload };
+    try {
+      localStorage.setItem("mvid-setup-draft", JSON.stringify(payload));
+    } catch {
+      /* ignore */
+    }
+    try {
+      const res = await fetch("/api/setup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (data.ok && data.setup) state.setup = data.setup;
+      else if (!data.ok) log(`Setup save failed: ${data.error || res.status}`);
+    } catch (err) {
+      log(`Setup save failed: ${err.message || err}`);
+    }
+  }
+
+  function readLocalSetupDraft() {
+    try {
+      const raw = localStorage.getItem("mvid-setup-draft");
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
   }
 
   async function loadSetupLists() {
@@ -64,6 +144,18 @@
       ]);
       const chars = await charsRes.json();
       const scenes = await scenesRes.json();
+      setupScenesCache = scenes.ok ? scenes.scenes || [] : [];
+
+      // Prefer server setup; fall back to localStorage draft
+      const localDraft = readLocalSetupDraft();
+      if (
+        localDraft?.locationsExplicit &&
+        (!state.setup?.locationsExplicit ||
+          !(state.setup?.locationIds?.length || state.setup?.locationsExplicit))
+      ) {
+        state.setup = { ...(state.setup || {}), ...localDraft };
+      }
+
       const castEl = $("castList");
       const selected = new Set(state.setup?.castIds || ["adam", "sasha"]);
       if (chars.ok) {
@@ -77,44 +169,94 @@
             </label>`,
           )
           .join("");
+        castEl.onchange = () => scheduleSetupSave();
       }
-      const locEl = $("setupScenesList");
-      const locSel = new Set(state.setup?.locationIds || []);
-      if (scenes.ok) {
-        locEl.className = "check-list";
-        locEl.innerHTML = (scenes.scenes || [])
-          .map((s) => {
-            const checked = !locSel.size || locSel.has(s.id) ? "checked" : "";
-            return `<label>
-              <input type="checkbox" value="${esc(s.id)}" ${checked} />
-              <span><strong>${esc(s.name || s.id)}</strong>
-              ${s.thumbUrl ? `<div><img src="${s.thumbUrl}" alt="" style="max-width:100%;border-radius:4px;margin-top:4px" /></div>` : ""}
-              </span>
-            </label>`;
-          })
-          .join("");
+
+      const explicit = state.setup?.locationsExplicit === true;
+      const locIds = explicit
+        ? state.setup?.locationIds || []
+        : setupScenesCache.map((s) => s.id);
+      renderRoomCards(setupScenesCache, locIds, { explicit: true });
+
+      // First paint with defaults → persist so refresh keeps the choice
+      if (!explicit) {
+        state.setup = {
+          ...(state.setup || {}),
+          locationIds: locIds,
+          locationsExplicit: true,
+          castIds: [...selected],
+        };
+        scheduleSetupSave();
       }
+
       if (state.setup?.title) $("setupTitle").value = state.setup.title;
       if (state.setup?.objective) $("setupObjective").value = state.setup.objective;
       if (state.setup?.theme) $("setupTheme").value = state.setup.theme;
+      for (const id of ["setupTitle", "setupObjective", "setupTheme"]) {
+        $(id)?.addEventListener("change", () => scheduleSetupSave());
+        $(id)?.addEventListener("blur", () => scheduleSetupSave());
+      }
       setupLoaded = true;
     } catch (err) {
       log(`Setup load failed: ${err.message || err}`);
     }
   }
 
+  function canStartFromSetup() {
+    return (
+      !state.running &&
+      !state.paused &&
+      state.stage !== "stopped" &&
+      !waitingGate() &&
+      (state.viewOnly ||
+        state.stage === "idle" ||
+        state.stage === "done" ||
+        state.stage === "error" ||
+        !state.stage)
+    );
+  }
+
+  /** Open batch with progress → Continue; empty/new → Start new project. */
+  function hasOpenSongProgress() {
+    return !!(
+      state.songDir &&
+      (state.progress?.furthestTab ||
+        state.tabs?.lyrics?.text ||
+        state.tabs?.keyframes?.images?.length ||
+        state.tabs?.song?.url)
+    );
+  }
+
+  function idlePrimaryAction() {
+    if (!canStartFromSetup()) return null;
+    if (hasOpenSongProgress()) {
+      const next = state.progress?.nextLabel || state.progress?.furthestLabel;
+      return {
+        kind: "continue",
+        label: next ? `Continue from ${next}` : "Continue pipeline",
+      };
+    }
+    return { kind: "new", label: "Start with this setup" };
+  }
+
   function updateButtons() {
     const gate = waitingGate();
     const paused = !!state.paused;
     const stopped = !!state.stopped || state.stage === "stopped";
-    const enabled = !!gate && !autoApprove.checked && !paused && !stopped;
+    const startReady = canStartFromSetup();
+    const idleAction = idlePrimaryAction();
+    // Waiting on a gate, OR idle/view-only first step → Approve starts/continues
+    const enabled = (!!gate && !paused && !stopped) || startReady;
     btnApprove.disabled = !enabled;
-    btnReject.disabled = !enabled || gate === "final" || gate === "setup";
+    btnReject.disabled = !gate || !enabled || gate === "final" || gate === "setup";
     if (gate === "final") btnReject.disabled = !enabled;
     if (gate === "setup") {
       btnApprove.disabled = !enabled;
       btnReject.disabled = true;
     }
+    btnApprove.textContent = idleAction
+      ? idleAction.label
+      : "Approve & continue";
     const btnPause = $("btnPause");
     const btnResume = $("btnResume");
     const btnStop = $("btnStop");
@@ -311,37 +453,90 @@
     });
   }
 
-  function markTabData(tabs) {
+  function markTabData(tabs, progress = state.progress) {
+    const completed = new Set(progress?.completedTabs || []);
+    const furthest = progress?.furthestTab || null;
     document.querySelectorAll(".tabs button").forEach((b) => {
       const key = b.dataset.tab;
       const data = tabs?.[key];
-      const has =
-        data &&
-        (data.text ||
-          data.url ||
-          data.beats?.length ||
-          data.images?.length ||
-          data.videos?.length ||
-          data.locations?.length ||
-          data.raw);
-      b.classList.toggle("has-data", !!has);
+      const hasContent =
+        key === "setup" ||
+        (data &&
+          (data.text ||
+            data.url ||
+            data.beats?.length ||
+            data.images?.length ||
+            data.videos?.length ||
+            data.locations?.length ||
+            data.raw));
+      const done = completed.has(key) || !!hasContent;
+      b.classList.toggle("has-data", !!done);
+      b.classList.toggle("at-progress", key === furthest);
+      b.title = done
+        ? key === furthest
+          ? progress?.complete
+            ? "Complete"
+            : `Furthest stage: ${progress?.furthestLabel || key}`
+          : "Has saved content"
+        : "Not reached yet";
     });
+    const rail = $("progressRail");
+    if (rail && progress?.steps?.length) {
+      rail.hidden = false;
+      rail.innerHTML = progress.steps
+        .map((s) => {
+          const cls = [
+            "progress-step",
+            s.done ? "is-done" : "",
+            s.current ? "is-current" : "",
+          ]
+            .filter(Boolean)
+            .join(" ");
+          return `<span class="${cls}" data-tab="${esc(s.tab)}" title="${esc(s.label)}">${esc(s.label)}</span>`;
+        })
+        .join("");
+    } else if (rail) {
+      rail.hidden = true;
+      rail.innerHTML = "";
+    }
   }
 
-  function renderLyrics(tabs) {
+  function furthestTabFromTabs(tabs) {
+    if (tabs?.final?.url) return "final";
+    if (tabs?.clips?.videos?.length) return "clips";
+    if (tabs?.keyframes?.images?.length) return "keyframes";
+    if (tabs?.scripts?.beats?.length) return "scripts";
+    if (tabs?.scenes?.locations?.length) return "scenes";
+    if (tabs?.storyline?.beats?.length) return "storyline";
+    if (tabs?.song?.url) return "song";
+    if (tabs?.lyrics?.text) return "lyrics";
+    return "setup";
+  }
+
+  function jumpToSongProgress(progress, tabs) {
+    const tab =
+      progress?.furthestTab || furthestTabFromTabs(tabs || state.tabs);
+    if (tab) selectTab(tab);
+  }
+
+  function renderLyrics(tabs, { force = false } = {}) {
     if (tabs?.lyrics?.text != null) {
-      // Don't clobber user edits while waiting on lyrics unless empty or stage just filled
       if (
+        force ||
         document.activeElement !== lyricsText ||
         !lyricsText.value ||
         waitingGate() === "lyrics"
       ) {
-        if (document.activeElement !== lyricsText) {
+        if (force || document.activeElement !== lyricsText) {
           lyricsText.value = tabs.lyrics.text;
+          lyricsText.dataset.touched = "";
         } else if (!lyricsText.dataset.touched) {
           lyricsText.value = tabs.lyrics.text;
         }
       }
+    } else if (force) {
+      lyricsText.value = "";
+      lyricsText.dataset.touched = "";
     }
   }
 
@@ -356,13 +551,13 @@
     el.innerHTML = `<p>${tabs.song.name}</p><audio controls src="${tabs.song.url}?t=${Date.now()}"></audio>`;
   }
 
-  function renderStoryline(tabs) {
+  function renderStoryline(tabs, { force = false } = {}) {
     const el = $("storylineView");
     const s = tabs?.storyline;
     if (!s) {
       el.className = "empty";
       el.textContent = "No storyline yet";
-      planRaw.value = "";
+      if (force || document.activeElement !== planRaw) planRaw.value = "";
       return;
     }
     el.className = "";
@@ -386,7 +581,7 @@
         <thead><tr><th>Beat</th><th>Arc</th><th>Room</th><th>Cause</th><th>Effect</th><th>Time</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
-    if (document.activeElement !== planRaw) {
+    if (force || document.activeElement !== planRaw) {
       planRaw.value = s.raw || "";
     }
   }
@@ -674,20 +869,22 @@
     el.innerHTML = `<video controls src="${tabs.final.url}?t=${Date.now()}"></video>`;
   }
 
-  function renderAll(tabs) {
-    renderLyrics(tabs);
+  function renderAll(tabs, { force = false } = {}) {
+    renderLyrics(tabs, { force });
     renderSong(tabs);
-    renderStoryline(tabs);
+    renderStoryline(tabs, { force });
     renderScenes(tabs);
     renderScripts(tabs);
     renderKeyframes(tabs);
     renderClips(tabs);
     renderFinal(tabs);
-    markTabData(tabs);
+    markTabData(tabs, state.progress);
   }
 
-  function applyState(s) {
+  function applyState(s, { jumpProgress = false } = {}) {
+    const prevSong = state.songDir;
     Object.assign(state, s);
+    if (s.progress) state.progress = s.progress;
     if (s.statusMessage) statusMsg.textContent = s.statusMessage;
     if (s.stage) stagePill.textContent = s.stage;
     if (typeof s.autoApprove === "boolean") autoApprove.checked = s.autoApprove;
@@ -710,12 +907,43 @@
       const opt = [...$("batchPicker").options].find((o) => o.value === s.songDir);
       if (opt) $("batchPicker").value = s.songDir;
     }
-    if (s.tabs) renderAll(s.tabs);
+    const songChanged = !!(s.songDir && s.songDir !== prevSong);
+    if (s.tabs) {
+      state.tabs = s.tabs;
+      renderAll(s.tabs, {
+        force: jumpProgress || songChanged || !!s.viewOnly,
+      });
+    } else if (state.tabs) {
+      markTabData(state.tabs, state.progress);
+    }
     updateButtons();
-    loadSetupLists();
+    // Drop stale setup-start intent once we've moved on
+    if (
+      state._pendingSetupStart &&
+      s.stage &&
+      s.stage !== "await_setup" &&
+      s.stage !== "setup" &&
+      s.stage !== "idle"
+    ) {
+      state._pendingSetupStart = null;
+    }
+    if (songChanged) {
+      setupLoaded = false;
+    }
+    if (setupLoaded && s.setup?.locationsExplicit && setupScenesCache.length) {
+      renderRoomCards(setupScenesCache, s.setup.locationIds || [], {
+        explicit: true,
+      });
+      if (s.setup.title != null && $("setupTitle")) $("setupTitle").value = s.setup.title;
+      if (s.setup.objective != null && $("setupObjective"))
+        $("setupObjective").value = s.setup.objective;
+      if (s.setup.theme != null && $("setupTheme")) $("setupTheme").value = s.setup.theme;
+    } else {
+      loadSetupLists();
+    }
 
     const gate = waitingGate();
-    if (gate && !state.paused) {
+    if (gate && !state.paused && !jumpProgress && !songChanged) {
       const tab =
         gate === "setup"
           ? "setup"
@@ -733,6 +961,9 @@
                       ? "final"
                       : activeTab;
       selectTab(tab);
+      if (gate === "setup") maybeApprovePendingSetup();
+    } else if (jumpProgress || songChanged) {
+      jumpToSongProgress(s.progress || state.progress, s.tabs || state.tabs);
     }
   }
 
@@ -748,17 +979,63 @@
     b.addEventListener("click", () => selectTab(b.dataset.tab));
   });
 
+  $("progressRail")?.addEventListener("click", (ev) => {
+    const step = ev.target.closest(".progress-step");
+    if (step?.dataset.tab) selectTab(step.dataset.tab);
+  });
+
   lyricsText.addEventListener("input", () => {
     lyricsText.dataset.touched = "1";
   });
 
   autoApprove.addEventListener("change", async () => {
-    await fetch("/api/auto-approve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: autoApprove.checked }),
-    });
+    const enabled = autoApprove.checked;
     updateButtons();
+    try {
+      // Flush cast/rooms before auto-resolving the setup gate
+      if (enabled && waitingGate() === "setup") {
+        await persistSetupDraft();
+      }
+      const res = await fetch("/api/auto-approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        log(`Auto-approve failed: ${data.error || res.status}`);
+        autoApprove.checked = false;
+        updateButtons();
+        return;
+      }
+      state.autoApprove = !!data.autoApprove;
+      if (enabled) {
+        const gate = waitingGate();
+        log(
+          gate
+            ? `Auto-approve ON — approving ${gate}…`
+            : "Auto-approve ON — will skip future gates",
+        );
+        // Belt-and-suspenders: if still waiting, send an explicit approve
+        if (gate) {
+          const payload = {};
+          if (gate === "setup") Object.assign(payload, collectSetupPayload());
+          if (gate === "lyrics") payload.text = lyricsText.value;
+          if (gate === "plan") payload.raw = planRaw.value;
+          await fetch("/api/approve", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ stage: gate, payload }),
+          });
+        }
+      } else {
+        log("Auto-approve OFF");
+      }
+    } catch (err) {
+      log(`Auto-approve error: ${err.message || err}`);
+      autoApprove.checked = false;
+      updateButtons();
+    }
   });
 
   $("gpuBackend")?.addEventListener("change", async () => {
@@ -847,16 +1124,12 @@
       log(`Open batch failed: ${data.error || res.status}`);
       return;
     }
-    state.songDir = data.songDir;
-    if (data.tabs) renderAll(data.tabs);
-    log(`Viewing ${data.songDir}`);
-    // Jump to richest available tab
-    const t = data.tabs || {};
-    if (t.final?.url) selectTab("final");
-    else if (t.clips?.videos?.length) selectTab("clips");
-    else if (t.keyframes?.images?.length) selectTab("keyframes");
-    else if (t.song?.url) selectTab("song");
-    else if (t.lyrics?.text) selectTab("lyrics");
+    setupLoaded = false;
+    applyState(data, { jumpProgress: true });
+    log(
+      `Opened ${data.songDir}` +
+        (data.progress?.summary ? ` · ${data.progress.summary}` : ""),
+    );
   });
 
   $("btnContinue")?.addEventListener("click", async () => {
@@ -881,6 +1154,12 @@
     ) {
       return;
     }
+    try {
+      localStorage.removeItem("mvid-setup-draft");
+    } catch {
+      /* ignore */
+    }
+    setupLoaded = false;
     const res = await fetch("/api/new-project", { method: "POST" });
     const data = await res.json();
     if (!data.ok) log(`New project failed: ${data.error}`);
@@ -961,6 +1240,37 @@
     log(`Created character ${data.character.id}`);
     setupLoaded = false;
     await loadSetupLists();
+  });
+
+  $("setupScenesList")?.addEventListener("click", (ev) => {
+    const card = ev.target.closest(".room-card");
+    if (!card) return;
+    const on = !card.classList.contains("is-on");
+    card.classList.toggle("is-on", on);
+    card.classList.toggle("is-off", !on);
+    card.setAttribute("aria-pressed", on ? "true" : "false");
+    updateRoomsCount();
+    scheduleSetupSave();
+  });
+
+  $("btnRoomsAll")?.addEventListener("click", () => {
+    document.querySelectorAll("#setupScenesList .room-card").forEach((card) => {
+      card.classList.add("is-on");
+      card.classList.remove("is-off");
+      card.setAttribute("aria-pressed", "true");
+    });
+    updateRoomsCount();
+    scheduleSetupSave();
+  });
+
+  $("btnRoomsNone")?.addEventListener("click", () => {
+    document.querySelectorAll("#setupScenesList .room-card").forEach((card) => {
+      card.classList.remove("is-on");
+      card.classList.add("is-off");
+      card.setAttribute("aria-pressed", "false");
+    });
+    updateRoomsCount();
+    scheduleSetupSave();
   });
 
   async function saveScripts() {
@@ -1096,7 +1406,72 @@
 
   btnApprove.addEventListener("click", async () => {
     const gate = waitingGate();
-    if (!gate) return;
+
+    // Idle / browsing: Continue an open batch, or start a brand-new project
+    if (!gate) {
+      if (!canStartFromSetup()) return;
+      const idleAction = idlePrimaryAction();
+      if (idleAction?.kind === "continue") {
+        btnApprove.disabled = true;
+        try {
+          const res = await fetch("/api/continue", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              fromStage: state.progress?.nextTab || state.progress?.furthestTab || null,
+            }),
+          });
+          const data = await res.json();
+          if (!data.ok) {
+            log(`Continue failed: ${data.error || res.status}`);
+            updateButtons();
+            return;
+          }
+          log(
+            data.resumed
+              ? `Resumed pipeline`
+              : `Continuing from ${state.progress?.nextLabel || state.progress?.furthestLabel || "next stage"}…`,
+          );
+        } catch (err) {
+          log(`Continue failed: ${err.message || err}`);
+          updateButtons();
+        }
+        return;
+      }
+      const payload = collectSetupPayload();
+      if (!payload.castIds?.length) {
+        log("Pick at least one cast member");
+        return;
+      }
+      if (!payload.locationIds?.length) {
+        log("Pick at least one room");
+        return;
+      }
+      btnApprove.disabled = true;
+      try {
+        await persistSetupDraft();
+        // When await_setup appears, approve it once with this payload
+        state._pendingSetupStart = payload;
+        const res = await fetch("/api/new-project", { method: "POST" });
+        const data = await res.json();
+        if (!data.ok) {
+          state._pendingSetupStart = null;
+          log(`Start failed: ${data.error || res.status}`);
+          updateButtons();
+          return;
+        }
+        log("Starting new project with current cast & rooms…");
+        selectTab("setup");
+        // If setup gate is already up (fast path), approve immediately
+        setTimeout(() => maybeApprovePendingSetup(), 50);
+      } catch (err) {
+        state._pendingSetupStart = null;
+        log(`Start failed: ${err.message || err}`);
+        updateButtons();
+      }
+      return;
+    }
+
     const payload = {};
     if (gate === "setup") Object.assign(payload, collectSetupPayload());
     if (gate === "lyrics") payload.text = lyricsText.value;
@@ -1128,6 +1503,10 @@
       log("Pick at least one cast member");
       return;
     }
+    if (gate === "setup" && !payload.locationIds?.length) {
+      log("Pick at least one room");
+      return;
+    }
     btnApprove.disabled = true;
     btnReject.disabled = true;
     const res = await fetch("/api/approve", {
@@ -1144,6 +1523,39 @@
       lyricsText.dataset.touched = "";
     }
   });
+
+  async function maybeApprovePendingSetup() {
+    if (!state._pendingSetupStart) return;
+    const gate = waitingGate();
+    // Auto-approve (or a prior click) may already have left setup — drop quietly
+    if (gate !== "setup") {
+      if (gate || state.stage === "lyrics" || state.stage?.startsWith("lyrics")) {
+        state._pendingSetupStart = null;
+      }
+      return;
+    }
+    const payload = state._pendingSetupStart;
+    state._pendingSetupStart = null;
+    try {
+      const res = await fetch("/api/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ stage: "setup", payload }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        // Harmless if the server already auto-approved setup
+        if (/not waiting on setup/i.test(data.error || "")) return;
+        log(`Setup approve failed: ${data.error || res.status}`);
+        updateButtons();
+      } else {
+        log("Approved setup");
+      }
+    } catch (err) {
+      log(`Setup approve failed: ${err.message || err}`);
+      updateButtons();
+    }
+  }
 
   btnReject.addEventListener("click", async () => {
     const gate = waitingGate();
@@ -1172,6 +1584,10 @@
       if (msg.type === "log") log(msg.message);
       else if (msg.type === "tabs") {
         state.tabs = msg.tabs;
+        if (!state.running) {
+          // Keep progress markers in sync when disk tabs refresh
+          state.progress = msg.progress || state.progress;
+        }
         renderAll(msg.tabs);
       } else if (msg.type === "remake_done") {
         markRemade(msg);

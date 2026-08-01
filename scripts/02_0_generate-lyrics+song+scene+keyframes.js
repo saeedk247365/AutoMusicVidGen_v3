@@ -89,6 +89,10 @@ import {
   objectiveForTheme,
   validateContinuity,
 } from "../lib/kids-hit.js";
+import {
+  ensureOllamaRunning,
+  DEFAULT_OLLAMA_URL,
+} from "../lib/ensure-ollama.js";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -130,7 +134,7 @@ const ACE_ROOT =
   "C:\\Users\\Saeed Khan\\AppData\\Local\\ProdesecStudio\\ACE-Step-1.5";
 const ACE_PYTHON = join(ACE_ROOT, ".venv", "Scripts", "python.exe");
 const ACE_SCRIPT = join(ROOT, "pipelines", "ace-generate-song.py");
-const OLLAMA_URL = "http://127.0.0.1:11434";
+const OLLAMA_URL = DEFAULT_OLLAMA_URL;
 
 // ─── Song prompts (edit freely) ─────────────────────────────────────────────
 
@@ -2395,16 +2399,14 @@ async function main() {
   console.log(`batch: ${batchDir}`);
 
   try {
-    const tags = await fetch(`${OLLAMA_URL}/api/tags`);
-    if (!tags.ok) throw new Error(`status ${tags.status}`);
+    await ensureOllamaRunning(OLLAMA_URL);
   } catch (err) {
-    if (!charsOnly && !scenesOnly) {
-      throw new Error(`Ollama not reachable at ${OLLAMA_URL}: ${err.message || err}`);
-    }
+    if (!charsOnly && !scenesOnly) throw err;
     console.log(`Ollama check skipped/failed: ${err.message || err}`);
   }
 
-  if (!charsOnly && !scenesOnly) {
+  // ACE is only needed once we generate audio (not for lyrics-only stops)
+  if (!charsOnly && !scenesOnly && stopAfter !== "lyrics") {
     if (!existsSync(ACE_PYTHON)) throw new Error(`ACE Python not found: ${ACE_PYTHON}`);
     if (!existsSync(ACE_SCRIPT)) throw new Error(`Missing ${ACE_SCRIPT}`);
   }

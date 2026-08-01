@@ -75,22 +75,27 @@
   </header>
 
   <nav class="tabs" id="tabNav">
-    <button type="button" data-tab="setup" class="active">Cast &amp; Scenes</button>
+    <button type="button" data-tab="setup" class="active">Cast &amp; Rooms</button>
     <button type="button" data-tab="lyrics">Lyrics</button>
     <button type="button" data-tab="song">Song</button>
     <button type="button" data-tab="storyline">Storyline</button>
-    <button type="button" data-tab="scenes">Scenes</button>
+    <button type="button" data-tab="scenes">Room plates</button>
     <button type="button" data-tab="scripts">Scripts</button>
     <button type="button" data-tab="keyframes">Keyframes</button>
     <button type="button" data-tab="clips">Clips</button>
     <button type="button" data-tab="final">Final</button>
   </nav>
+  <div class="progress-rail" id="progressRail" hidden></div>
 
   <main class="panes">
     <section class="pane active" id="pane-setup">
-      <p class="hint">Pick cast and rooms first. Optional title/objective lock lyric generation.</p>
+      <p class="hint">
+        Choose who appears and which rooms the song may use.
+        Then press <strong>Start with this setup</strong> (or check Auto-approve and Start).
+        Selection is saved automatically.
+      </p>
       <div class="setup-grid">
-        <div>
+        <div class="setup-col">
           <h3>Cast</h3>
           <div id="castList" class="check-list empty">Loading characters…</div>
           <details class="create-box">
@@ -106,12 +111,20 @@
             <button type="button" id="btnCreateChar" class="btn">Save character</button>
           </details>
         </div>
-        <div>
-          <h3>Scenes</h3>
-          <div id="setupScenesList" class="check-list empty">Loading scenes…</div>
+        <div class="setup-col setup-col-rooms">
+          <div class="rooms-header">
+            <h3>Rooms</h3>
+            <div class="rooms-actions">
+              <button type="button" class="btn btn-quiet" id="btnRoomsAll">All</button>
+              <button type="button" class="btn btn-quiet" id="btnRoomsNone">None</button>
+              <span class="meta" id="roomsCount"></span>
+            </div>
+          </div>
+          <p class="rooms-hint meta">Tap a room to include or exclude it.</p>
+          <div id="setupScenesList" class="room-grid empty">Loading rooms…</div>
         </div>
-        <div>
-          <h3>Brief (optional locks)</h3>
+        <div class="setup-col">
+          <h3>Brief <span class="meta">(optional)</span></h3>
           <label class="field">Title <input id="setupTitle" placeholder="Song title" /></label>
           <label class="field">Objective <input id="setupObjective" placeholder="One toddler goal" /></label>
           <label class="field">Theme hint <input id="setupTheme" placeholder="e.g. rainy day indoor march" /></label>
@@ -139,8 +152,8 @@
     </section>
 
     <section class="pane" id="pane-scenes">
-      <p class="hint">Furnished room plates used by each beat (play lane + midground furniture).</p>
-      <div id="scenesGrid" class="grid empty">No scenes yet</div>
+      <p class="hint">Generated furnished room plates for this song’s beats (after the plan runs).</p>
+      <div id="scenesGrid" class="grid empty">No room plates yet</div>
     </section>
 
     <section class="pane" id="pane-scripts">

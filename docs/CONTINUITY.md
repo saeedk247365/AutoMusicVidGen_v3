@@ -68,6 +68,27 @@ A preschooler should answer from picture alone:
 - `placement.Adam`: `left` \| `center` \| `right` (still **start**; inherited same-room unless walk/exit)
 - `endPlacement.Adam`: where Wan should finish (matches next still start)
 
+## Wan last-frame chain (hybrid, **on by default** for kids-hit)
+
+Kids-hit animate seeds Wan from the **previous clip’s end frame** when the story stays in the same room. That stops every beat from snapping back to a static keyframe pose.
+
+| Seed from previous end frame | Seed from authored keyframe |
+|------|---------|
+| Same room (cast may change) | Room change / bridge |
+| Soft cuts (`look`, `point`, `match_action`, `energy`, …) | `exit` (or previous beat was `exit`) |
+
+Same-room clips **blend** the previous end-frame with the next keyframe (~82% end / ~18% still; ~55/45 on cast change) so Mom can enter/exit without a hard cut, while pose stays continuous.
+
+End frames live under `clips/_continuity/<stem>_end.png`.
+
+Opt out with `--no-frame-chain` (or setup `noFrameChain: true`) if you want every clip from its authored still.
+
+Classic animate (no `--kids-hit`) is unchanged — always keyframe → Wan.
+
+### Why keyframes still look different
+
+Keyframes are still **authored storyboards** (pose / cast layout per beat). Chaining uses them as a *hint* via blend, not as a hard Wan restart when the room continues. The gallery will still show different stills — the video should not snap to them.
+
 ## Golden example
 
 See `batches/_templates/continuity-golden-rainy-march.json`.
