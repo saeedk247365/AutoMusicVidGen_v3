@@ -394,7 +394,9 @@
       salad.cpuPercent != null
         ? `CPU ${fmtPct(salad.cpuPercent)}`
         : saladLive
-          ? "CPU n/a (set SALAD_ORG)"
+          ? salad.mgmtConfigured
+            ? "CPU —"
+            : "CPU n/a"
           : saladDown
             ? `CPU · ${downLabel}`
             : "CPU —",
@@ -1220,6 +1222,94 @@
     if (!data.ok) log(`Salad shutdown failed: ${data.error}`);
     else log("Salad shutdown requested");
     await refreshSaladStatus();
+  });
+
+  async function refreshComfyOps() {
+    const body = $("saladOpsBody");
+    const urlEl = $("saladOpsUrl");
+    if (body) body.textContent = "Loading…";
+    try {
+      const res = await fetch("/api/comfy/ops?stage=clips");
+      const data = await res.json();
+      if (!data.ok) {
+        if (body) body.textContent = data.error || "Ops failed";
+        return;
+      }
+      if (urlEl) urlEl.textContent = data.url || "";
+      const lines = [
+        `backend=${data.backend}  salad=${data.salad ? "yes" : "no"}  up=${data.up ? "yes" : "no"}`,
+        `queue: running=${data.running}  pending=${data.pending}`,
+      ];
+      if (data.runningIds?.length) {
+        lines.push(`running ids: ${data.runningIds.join(", ")}`);
+      }
+      if (data.pendingIds?.length) {
+        lines.push(`pending ids: ${data.pendingIds.join(", ")}`);
+      }
+      if (data.queueError) lines.push(`queue err: ${data.queueError}`);
+      if (data.devices?.length) {
+        for (const d of data.devices) {
+          lines.push(
+            `gpu ${d.name}: VRAM ${d.vramUsedMb ?? "?"} / ${d.vramTotalMb ?? "?"} MB` +
+              (d.vramFreeMb != null ? ` (free ${d.vramFreeMb})` : ""),
+          );
+        }
+      } else if (data.statsError) {
+        lines.push(`stats err: ${data.statsError}`);
+      }
+      if (data.comfy) lines.push(`comfy ${data.comfy}`);
+      if (data.pytorch) lines.push(`pytorch ${data.pytorch}`);
+      if (body) body.textContent = lines.join("\n");
+    } catch (err) {
+      if (body) body.textContent = err.message || String(err);
+    }
+  }
+
+  $("btnSaladOps")?.addEventListener("click", async () => {
+    const panel = $("saladOpsPanel");
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) await refreshComfyOps();
+  });
+  $("btnSaladOpsClose")?.addEventListener("click", () => {
+    const panel = $("saladOpsPanel");
+    if (panel) panel.hidden = true;
+  });
+  $("btnComfyRefreshOps")?.addEventListener("click", () => refreshComfyOps());
+  $("btnComfyInterrupt")?.addEventListener("click", async () => {
+    log("Comfy interrupt…");
+    const res = await fetch("/api/comfy/interrupt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage: "clips" }),
+    });
+    const data = await res.json();
+    log(data.ok ? "Interrupted" : `Interrupt failed: ${data.error}`);
+    await refreshComfyOps();
+  });
+  $("btnComfyClearQueue")?.addEventListener("click", async () => {
+    if (!confirm("Clear the Comfy queue on the clips GPU?")) return;
+    log("Clearing Comfy queue…");
+    const res = await fetch("/api/comfy/clear-queue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage: "clips" }),
+    });
+    const data = await res.json();
+    log(data.ok ? "Queue cleared" : `Clear failed: ${data.error}`);
+    await refreshComfyOps();
+  });
+  $("btnComfyReset")?.addEventListener("click", async () => {
+    if (!confirm("Interrupt + clear queue + free VRAM on clips GPU?")) return;
+    log("Resetting Comfy execution…");
+    const res = await fetch("/api/comfy/reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stage: "clips" }),
+    });
+    const data = await res.json();
+    log(data.ok ? "Comfy reset done" : `Reset failed: ${data.error}`);
+    await refreshComfyOps();
   });
 
   $("btnCreateChar")?.addEventListener("click", async () => {
