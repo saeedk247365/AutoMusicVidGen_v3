@@ -105,25 +105,45 @@
   <main class="panes">
     <section class="pane active" id="pane-setup">
       <p class="hint">
-        Choose who appears and which rooms the song may use.
-        Then press <strong>Start with this setup</strong> (or check Auto-approve and Start).
-        Selection is saved automatically.
+        <strong>New</strong> invents a title, theme, and goal. Tweak cast &amp; rooms, then
+        <strong>Start with this setup</strong> — or press New again for another idea.
       </p>
+      <div class="brief-card" id="briefCard">
+        <div class="brief-card-top">
+          <h3>Song brief</h3>
+          <button type="button" id="btnShuffleBrief" class="btn btn-quiet" title="Pick another title / theme">Shuffle</button>
+        </div>
+        <label class="field brief-title-field">
+          Title
+          <input id="setupTitle" placeholder="Song title" />
+        </label>
+        <div class="brief-row">
+          <label class="field">Theme hint <input id="setupTheme" placeholder="e.g. rainy day indoor march" /></label>
+          <label class="field">Objective <input id="setupObjective" placeholder="One toddler goal" /></label>
+        </div>
+      </div>
       <div class="setup-grid">
         <div class="setup-col">
           <h3>Cast</h3>
-          <div id="castList" class="check-list empty">Loading characters…</div>
-          <details class="create-box">
-            <summary>Create character</summary>
-            <input id="newCharName" placeholder="Name" />
-            <select id="newCharRole">
-              <option value="toddler">toddler</option>
-              <option value="helper">helper / mom</option>
-              <option value="other">other</option>
-            </select>
-            <textarea id="newCharAppearance" rows="2" placeholder="Appearance…"></textarea>
-            <textarea id="newCharOutfit" rows="2" placeholder="Outfit…"></textarea>
-            <button type="button" id="btnCreateChar" class="btn">Save character</button>
+          <div id="castList" class="cast-grid empty">Loading characters…</div>
+          <details class="create-box panel-box" id="createCharBox">
+            <summary>New character</summary>
+            <div class="form-stack">
+              <div class="preset-row" id="newCharPresets"></div>
+              <label class="field">Name <input id="newCharName" placeholder="Name" /></label>
+              <label class="field">Role
+                <select id="newCharRole">
+                  <option value="toddler">toddler</option>
+                  <option value="helper">helper / mom</option>
+                  <option value="other">other</option>
+                </select>
+              </label>
+              <label class="field">Appearance <textarea id="newCharAppearance" rows="2" placeholder="Face, hair, build…"></textarea></label>
+              <label class="field">Outfit <textarea id="newCharOutfit" rows="2" placeholder="Clothes…"></textarea></label>
+              <label class="field">Negative <textarea id="newCharNegative" rows="2" placeholder="Optional — defaults by role"></textarea></label>
+              <label class="field">Style tag <input id="newCharStyle" placeholder="Optional" /></label>
+              <button type="button" id="btnCreateChar" class="btn primary">Save character</button>
+            </div>
           </details>
         </div>
         <div class="setup-col setup-col-rooms">
@@ -137,14 +157,193 @@
           </div>
           <p class="rooms-hint meta">Tap a room to include or exclude it.</p>
           <div id="setupScenesList" class="room-grid empty">Loading rooms…</div>
-        </div>
-        <div class="setup-col">
-          <h3>Brief <span class="meta">(optional)</span></h3>
-          <label class="field">Title <input id="setupTitle" placeholder="Song title" /></label>
-          <label class="field">Objective <input id="setupObjective" placeholder="One toddler goal" /></label>
-          <label class="field">Theme hint <input id="setupTheme" placeholder="e.g. rainy day indoor march" /></label>
+          <details class="create-box panel-box room-studio" id="roomStudio">
+            <summary>New room</summary>
+            <div class="form-stack">
+              <div class="preset-row" id="roomPresets"></div>
+              <label class="field">Name <input id="newRoomName" placeholder="e.g. Attic" /></label>
+              <label class="field">Id <input id="newRoomId" placeholder="auto from name" /></label>
+              <label class="field">Still prompt <textarea id="newRoomStill" rows="3" placeholder="Empty room description…"></textarea></label>
+              <label class="check-row"><input type="checkbox" id="newRoomGenerate" checked /> Generate plate now</label>
+              <button type="button" id="btnCreateRoom" class="btn primary">Save room</button>
+              <pre class="studio-log" id="roomLog" hidden></pre>
+            </div>
+          </details>
         </div>
       </div>
+
+      <section class="workshop" id="charStudio">
+        <div class="workshop-head">
+          <div>
+            <h3>Character workshop</h3>
+            <p class="meta">Master → dataset → LoRA. Progress shows here while jobs run.</p>
+          </div>
+          <label class="field workshop-char-field">
+            Character
+            <select id="studioCharSelect">
+              <option value="">Select…</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="studio-body" id="studioBody" hidden>
+          <div class="studio-steps" id="studioSteps" aria-hidden="true">
+            <span class="studio-step" data-step="master">Master</span>
+            <span class="studio-step" data-step="dataset">Dataset</span>
+            <span class="studio-step" data-step="train">LoRA</span>
+          </div>
+
+          <div class="studio-banner" id="studioBanner" hidden>
+            <div class="studio-banner-spin" id="studioBannerSpin" hidden></div>
+            <div class="studio-banner-text">
+              <strong id="studioBannerTitle">Idle</strong>
+              <span class="meta" id="studioBannerSub"></span>
+            </div>
+          </div>
+
+          <div class="workshop-main">
+            <div class="workshop-visual">
+              <div class="studio-master-wrap studio-master-lg" id="studioMasterWrap">
+                <span class="meta" id="studioMasterEmpty">No master yet</span>
+                <img id="studioMasterImg" alt="Master identity" hidden />
+              </div>
+              <div class="studio-status" id="studioStatus"></div>
+              <div class="studio-candidates" id="studioCandidates" hidden></div>
+              <div class="studio-dataset-block">
+                <div class="studio-dataset-head">
+                  <strong>Dataset</strong>
+                  <span class="meta" id="studioDatasetMeta">0 images</span>
+                </div>
+                <div class="studio-dataset-progress" id="studioDatasetProgress" hidden>
+                  <div class="studio-dataset-progress-bar"><span id="studioDatasetProgressFill"></span></div>
+                  <strong id="studioDatasetProgressText">0 / 0</strong>
+                </div>
+                <p class="meta studio-dataset-hint">Click any plate to preview as a slideshow. Remake regenerates that keyframe or shot in place. Training plates use chroma-green on purpose.</p>
+                <div class="studio-dataset-grid" id="studioDatasetGrid">
+                  <span class="meta">No training images yet</span>
+                </div>
+                <div class="dataset-lightbox" id="datasetLightbox" hidden>
+                  <div class="dataset-lightbox-backdrop" data-lightbox-close></div>
+                  <div class="dataset-lightbox-panel" role="dialog" aria-modal="true" aria-label="Dataset slideshow">
+                    <div class="dataset-lightbox-toolbar">
+                      <strong id="datasetLightboxCaption">Plate</strong>
+                      <div class="dataset-lightbox-actions">
+                        <button type="button" class="btn tiny" id="btnLightboxPrev">← Prev</button>
+                        <button type="button" class="btn tiny" id="btnLightboxNext">Next →</button>
+                        <button type="button" class="btn tiny primary" id="btnLightboxRemake">Remake</button>
+                        <button type="button" class="btn tiny" id="btnLightboxEdit" hidden>Edit prompts</button>
+                        <button type="button" class="btn tiny btn-quiet" id="btnLightboxClose" data-lightbox-close>Close</button>
+                      </div>
+                    </div>
+                    <div class="dataset-lightbox-stage">
+                      <img id="datasetLightboxImg" alt="Dataset plate" />
+                      <div class="dataset-lightbox-busy" id="datasetLightboxBusy" hidden>Remaking…</div>
+                    </div>
+                    <p class="meta" id="datasetLightboxHint"></p>
+                  </div>
+                </div>
+                <div class="shot-editor" id="shotEditor" hidden>
+                  <div class="shot-editor-top">
+                    <img id="shotEditorImg" alt="Shot preview" />
+                    <div class="shot-editor-meta">
+                      <strong id="shotEditorTitle">Shot</strong>
+                      <span class="meta" id="shotEditorFile"></span>
+                      <div class="shot-editor-actions">
+                        <button type="button" id="btnShotRegen" class="btn primary">Save + regenerate</button>
+                        <button type="button" id="btnShotSave" class="btn">Save prompts</button>
+                        <button type="button" id="btnShotEditorClose" class="btn btn-quiet">Close</button>
+                      </div>
+                    </div>
+                  </div>
+                  <p class="meta">Edits apply to this shot only (blank appearance/outfit/negative = use character defaults).</p>
+                  <label class="field">Pose <textarea id="shotPose" rows="2"></textarea></label>
+                  <label class="field">Angle text <textarea id="shotAngle" rows="2"></textarea></label>
+                  <label class="field">Caption extra <input id="shotCaptionExtra" /></label>
+                  <div class="brief-row">
+                    <label class="field">Angle key <input id="shotAngleKey" /></label>
+                    <label class="field">Pose key <input id="shotPoseKey" /></label>
+                  </div>
+                  <div class="brief-row">
+                    <label class="field">Expression <input id="shotExpression" /></label>
+                    <label class="check-row shot-bust-row"><input type="checkbox" id="shotBust" /> Bust / close-up</label>
+                  </div>
+                  <label class="field">Appearance override <textarea id="shotAppearance" rows="2" placeholder="Optional — leave blank to use character appearance"></textarea></label>
+                  <label class="field">Outfit override <textarea id="shotOutfit" rows="2" placeholder="Optional"></textarea></label>
+                  <label class="field">Negative override <textarea id="shotNegative" rows="2" placeholder="Optional"></textarea></label>
+                  <label class="field">Extra negative <textarea id="shotExtraNegative" rows="2"></textarea></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="workshop-controls">
+              <div class="studio-top-bar">
+                <label class="field studio-count-field">
+                  Masters
+                  <select id="studioMasterCount">
+                    <option value="1">1</option>
+                    <option value="2" selected>2</option>
+                    <option value="5">5</option>
+                    <option value="10">10</option>
+                  </select>
+                </label>
+                <div class="studio-actions studio-actions-top">
+                  <button type="button" id="btnStudioMaster" class="btn primary">Generate master</button>
+                  <button type="button" id="btnStudioApprove" class="btn" disabled>Approve</button>
+                  <button type="button" id="btnStudioDataset" class="btn" disabled>Generate dataset</button>
+                  <button type="button" id="btnStudioTrain" class="btn" disabled>Train LoRA</button>
+                  <button type="button" id="btnStudioSave" class="btn btn-quiet">Save prompts</button>
+                </div>
+              </div>
+
+              <div class="studio-upload-row">
+                <div class="studio-upload-card">
+                  <strong>Real photo → FaceID</strong>
+                  <p class="meta">Upload a clear face photo. Autofills outfit/style prompts, then invents cartoon master candidates.</p>
+                  <div class="studio-upload-actions">
+                    <input type="file" id="studioFaceRefFile" accept="image/png,image/jpeg,image/webp" hidden />
+                    <button type="button" id="btnStudioFaceRef" class="btn">Upload face photo</button>
+                    <span class="meta" id="studioFaceRefStatus"></span>
+                  </div>
+                  <img id="studioFaceRefPreview" class="studio-upload-preview" alt="" hidden />
+                </div>
+                <div class="studio-upload-card">
+                  <strong>Cartoon still → master</strong>
+                  <p class="meta">Upload a style-matched cartoon still. Autofills prompts and installs it as the master.</p>
+                  <div class="studio-upload-actions">
+                    <input type="file" id="studioStillFile" accept="image/png,image/jpeg,image/webp" hidden />
+                    <button type="button" id="btnStudioStill" class="btn">Upload cartoon still</button>
+                    <span class="meta" id="studioStillStatus"></span>
+                  </div>
+                  <img id="studioStillPreview" class="studio-upload-preview" alt="" hidden />
+                </div>
+              </div>
+              <div class="studio-upload-actions" style="margin:0 0 0.75rem">
+                <button type="button" id="btnStudioDescribe" class="btn btn-quiet">Autofill prompts from image</button>
+                <span class="meta" id="studioDescribeStatus"></span>
+              </div>
+
+              <div class="preset-row" id="studioPresets"></div>
+              <label class="field">Appearance <textarea id="studioAppearance" rows="3"></textarea></label>
+              <label class="field">Outfit <textarea id="studioOutfit" rows="2"></textarea></label>
+              <label class="field">Negative <textarea id="studioNegative" rows="2"></textarea></label>
+              <div class="brief-row">
+                <label class="field">Style tag <input id="studioStyleTag" /></label>
+                <label class="field">Age / type <input id="studioAge" /></label>
+              </div>
+              <label class="field">Trigger <input id="studioTrigger" /></label>
+            </div>
+          </div>
+
+          <div class="studio-log-wrap">
+            <div class="studio-log-head">
+              <strong>Activity</strong>
+              <span class="meta" id="studioLogHint">Live job output</span>
+            </div>
+            <pre class="studio-log studio-log-live" id="studioLog">Select a character, then generate.</pre>
+          </div>
+        </div>
+        <p class="workshop-empty meta" id="studioEmptyHint">Pick a cast member above to open the workshop.</p>
+      </section>
     </section>
 
     <section class="pane" id="pane-lyrics">
@@ -195,11 +394,13 @@
     </section>
 
     <section class="pane" id="pane-final">
-      <p class="hint">Final music video.</p>
+      <p class="hint">Final music video + YouTube package (title, description, thumbnail).</p>
       <div id="finalPlayer" class="empty">No final yet</div>
+      <div id="youtubePackage" class="yt-package empty" hidden></div>
     </section>
   </main>
 
+  <div class="toast-stack" id="toastStack" aria-live="polite"></div>
   <footer class="log" id="log"></footer>
 
   <script>

@@ -485,12 +485,38 @@ async function stitchSong(songDir) {
   }
 
   console.log(`  mux audio → ${outPath}`);
+  // Prefer full audio length; pad video if still short after loop-fill
+  let muxVideo = videoForMux;
+  let muxVideoDur = await ffprobeDuration(muxVideo);
+  const muxPad = Math.max(0, audioDur - muxVideoDur);
+  if (muxPad > 0.02) {
+    const muxPadPath = join(workDir, "mux_pad.mp4");
+    await execFileAsync(
+      "ffmpeg",
+      [
+        "-y",
+        "-i",
+        muxVideo,
+        "-vf",
+        `tpad=stop_mode=clone:stop_duration=${muxPad.toFixed(3)}`,
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        muxPadPath,
+      ],
+      { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+    );
+    muxVideo = muxPadPath;
+    muxVideoDur = await ffprobeDuration(muxVideo);
+  }
   await execFileAsync(
     "ffmpeg",
     [
       "-y",
       "-i",
-      videoForMux,
+      muxVideo,
       "-i",
       mp3,
       "-map",
@@ -507,22 +533,23 @@ async function stitchSong(songDir) {
       "aac",
       "-b:a",
       "192k",
-      "-shortest",
+      "-t",
+      audioDur.toFixed(3),
       outPath,
     ],
     { windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
   );
 
-  const finalPad = Math.max(0, audioDur - videoDur);
+  const finalPad = Math.max(0, audioDur - muxVideoDur);
   const manifest = {
     songDir,
     createdAt: new Date().toISOString(),
     mode,
     clips: clips.map((c) => basename(c)),
     mp3: basename(mp3),
-    videoDurationSec: videoDur,
+    videoDurationSec: muxVideoDur,
     audioDurationSec: audioDur,
-    padSec: loopFill ? Math.min(finalPad, 0.15) : finalPad,
+    padSec: finalPad,
     loopCounts,
     final: outPath,
   };

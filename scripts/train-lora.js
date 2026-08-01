@@ -31,6 +31,12 @@ if (args.includes("--salad") || flag("--backend") === "salad") {
     console.error(sw.error);
     process.exit(2);
   }
+} else if (flag("--backend") === "local" || args.includes("--local")) {
+  const sw = setGpuBackend("local");
+  if (!sw.ok) {
+    console.error(sw.error);
+    process.exit(2);
+  }
 }
 
 const TRAIN_CONFIG_PATH = join(ROOT, flag("--train-config", "train-config.json"));
@@ -76,7 +82,11 @@ async function loadConfig() {
     comfyRoot,
     comfyUrl: salad
       ? resolveComfyUrl()
-      : train.comfyUrl || character.comfyUrl || resolveComfyUrl(),
+      : flag("--comfy", null) ||
+        train.comfyUrl ||
+        character.comfyUrl ||
+        resolveComfyUrl() ||
+        "http://127.0.0.1:8888",
     remote: salad,
     checkpoint: train.checkpoint || character.checkpoint || "realcartoon3d_v15.safetensors",
     loraName: train.loraName || `${trigger}_character_v1`,

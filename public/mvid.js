@@ -28,12 +28,65 @@
   let setupScenesCache = [];
   let setupSaveTimer = null;
 
-  function log(msg) {
+  function log(msg, { t = Date.now(), skipStore = false } = {}) {
     const line = document.createElement("div");
     line.className = "line";
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    const stamp = new Date(t).toLocaleTimeString();
+    line.textContent = `[${stamp}] ${msg}`;
+    line.dataset.t = String(t);
+    line.dataset.msg = String(msg);
     logEl.appendChild(line);
     logEl.scrollTop = logEl.scrollHeight;
+    if (!skipStore) persistLogs();
+  }
+
+  function persistLogs() {
+    try {
+      const lines = [...logEl.querySelectorAll(".line")].map((el) => ({
+        t: Number(el.dataset.t) || Date.now(),
+        message: el.dataset.msg || el.textContent.replace(/^\[[^\]]+\]\s*/, ""),
+      }));
+      sessionStorage.setItem("mvid-logs", JSON.stringify(lines.slice(-400)));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function restoreLogsFromSession() {
+    try {
+      const raw = sessionStorage.getItem("mvid-logs");
+      if (!raw) return;
+      const lines = JSON.parse(raw);
+      if (!Array.isArray(lines) || !lines.length) return;
+      logEl.innerHTML = "";
+      for (const row of lines) {
+        if (row?.message) log(row.message, { t: row.t || Date.now(), skipStore: true });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function applyLogHistory(lines) {
+    if (!Array.isArray(lines) || !lines.length) return;
+    const byKey = new Map();
+    for (const el of [...logEl.querySelectorAll(".line")]) {
+      const message = el.dataset.msg || "";
+      if (!message) continue;
+      const t = Number(el.dataset.t) || Date.now();
+      byKey.set(`${t}|${message}`, { t, message });
+    }
+    for (const row of lines) {
+      if (!row?.message) continue;
+      const t = row.t || Date.now();
+      byKey.set(`${t}|${row.message}`, { t, message: row.message });
+    }
+    const merged = [...byKey.values()].sort((a, b) => a.t - b.t).slice(-400);
+    logEl.innerHTML = "";
+    for (const row of merged) {
+      log(row.message, { t: row.t, skipStore: true });
+    }
+    persistLogs();
   }
 
   function waitingGate() {
@@ -52,6 +105,7 @@
       castIds,
       locationIds,
       locationsExplicit: true,
+      roomsLockedByUser: !!state.setup?.roomsLockedByUser,
       title: $("setupTitle")?.value?.trim() || "",
       objective: $("setupObjective")?.value?.trim() || "",
       theme: $("setupTheme")?.value?.trim() || "",
@@ -159,17 +213,37 @@
       const castEl = $("castList");
       const selected = new Set(state.setup?.castIds || ["adam", "sasha"]);
       if (chars.ok) {
-        castEl.className = "check-list";
+        castEl.className = "cast-grid";
         castEl.innerHTML = (chars.characters || [])
-          .map(
-            (c) => `<label>
-              <input type="checkbox" value="${esc(c.id)}" ${selected.has(c.id) ? "checked" : ""} />
-              <span><strong>${esc(c.name)}</strong> <span class="meta">${esc(c.role)}${c.hasLora ? " · LoRA" : ""}</span>
-              <div class="meta">${esc((c.appearance || "").slice(0, 90))}</div></span>
-            </label>`,
-          )
+          .map((c) => {
+            const on = selected.has(c.id);
+            const badge = c.masterApproved
+              ? "master ✓"
+              : c.hasMaster
+                ? "master ?"
+                : c.hasLora
+                  ? "LoRA"
+                  : c.role || "";
+            const initial = esc((c.name || c.id || "?").charAt(0).toUpperCase());
+            return `<label class="cast-card ${on ? "is-on" : ""}">
+              <input type="checkbox" value="${esc(c.id)}" ${on ? "checked" : ""} />
+              <span class="cast-avatar" aria-hidden="true">${initial}</span>
+              <span class="cast-info">
+                <span class="cast-name">${esc(c.name)}</span>
+                <div class="cast-meta">${esc(badge)}</div>
+                <div class="cast-blurb">${esc((c.appearance || "").slice(0, 80))}</div>
+              </span>
+            </label>`;
+          })
           .join("");
-        castEl.onchange = () => scheduleSetupSave();
+        castEl.onchange = (ev) => {
+          const card = ev.target.closest?.(".cast-card");
+          if (card && ev.target.matches?.("input[type=checkbox]")) {
+            card.classList.toggle("is-on", ev.target.checked);
+          }
+          scheduleSetupSave();
+        };
+        fillStudioSelect(chars.characters || []);
       }
 
       const explicit = state.setup?.locationsExplicit === true;
@@ -189,9 +263,7 @@
         scheduleSetupSave();
       }
 
-      if (state.setup?.title) $("setupTitle").value = state.setup.title;
-      if (state.setup?.objective) $("setupObjective").value = state.setup.objective;
-      if (state.setup?.theme) $("setupTheme").value = state.setup.theme;
+      applyBriefToForm(state.setup);
       for (const id of ["setupTitle", "setupObjective", "setupTheme"]) {
         $(id)?.addEventListener("change", () => scheduleSetupSave());
         $(id)?.addEventListener("blur", () => scheduleSetupSave());
@@ -199,6 +271,29 @@
       setupLoaded = true;
     } catch (err) {
       log(`Setup load failed: ${err.message || err}`);
+    }
+  }
+
+  function applyBriefToForm(brief) {
+    if (!brief) return;
+    if (brief.title != null && $("setupTitle")) $("setupTitle").value = brief.title;
+    if (brief.objective != null && $("setupObjective"))
+      $("setupObjective").value = brief.objective;
+    if (brief.theme != null && $("setupTheme")) $("setupTheme").value = brief.theme;
+    // Auto rooms from brief unless the user locked room picks
+    if (
+      Array.isArray(brief.locationIds) &&
+      brief.locationIds.length &&
+      !state.setup?.roomsLockedByUser &&
+      setupScenesCache.length
+    ) {
+      state.setup = {
+        ...(state.setup || {}),
+        locationIds: brief.locationIds,
+        locationsExplicit: true,
+        roomsLockedByUser: false,
+      };
+      renderRoomCards(setupScenesCache, brief.locationIds, { explicit: true });
     }
   }
 
@@ -271,7 +366,13 @@
         (!!state.running && !state.paused) || !state.songDir || stopped;
     }
     if (btnNewProject) {
-      btnNewProject.disabled = !!state.running;
+      // Allow New while waiting on setup (reshuffles brief)
+      btnNewProject.disabled =
+        !!state.running && state.stage !== "await_setup";
+      btnNewProject.title =
+        state.stage === "await_setup"
+          ? "Generate another title / theme / objective"
+          : "Start a brand-new project with a fresh brief";
     }
   }
 
@@ -456,30 +557,22 @@
   }
 
   function markTabData(tabs, progress = state.progress) {
-    const completed = new Set(progress?.completedTabs || []);
+    const stepMap = new Map((progress?.steps || []).map((s) => [s.tab, s]));
     const furthest = progress?.furthestTab || null;
     document.querySelectorAll(".tabs button").forEach((b) => {
       const key = b.dataset.tab;
-      const data = tabs?.[key];
-      const hasContent =
-        key === "setup" ||
-        (data &&
-          (data.text ||
-            data.url ||
-            data.beats?.length ||
-            data.images?.length ||
-            data.videos?.length ||
-            data.locations?.length ||
-            data.raw));
-      const done = completed.has(key) || !!hasContent;
-      b.classList.toggle("has-data", !!done);
+      const step = stepMap.get(key);
+      // Only green when this project's progress says the stage finished —
+      // never from leftover tab payload after New.
+      const done = !!step?.done;
+      b.classList.toggle("has-data", done);
       b.classList.toggle("at-progress", key === furthest);
       b.title = done
         ? key === furthest
           ? progress?.complete
             ? "Complete"
             : `Furthest stage: ${progress?.furthestLabel || key}`
-          : "Has saved content"
+          : "Stage complete"
         : "Not reached yet";
     });
     const rail = $("progressRail");
@@ -626,6 +719,7 @@
     "walk",
     "stomp",
     "clap",
+    "wash",
     "stretch",
     "tiptoe",
     "dance",
@@ -830,9 +924,17 @@
       } else {
         const mtime = preview.mtime || Date.now();
         const n = preview.clips || tabs?.clips?.videos?.length || "?";
+        const wasPlaying = $("previewVideo");
+        const resumeAt = wasPlaying && !wasPlaying.paused ? wasPlaying.currentTime : null;
         previewEl.className = "";
-        previewEl.innerHTML = `<p class="hint">Progressive preview · ${n} clip(s) + sound</p>
+        previewEl.innerHTML = `<p class="hint">Progressive preview · ${n} clip(s) + sound · playing clip highlighted below</p>
           <video id="previewVideo" controls src="${preview.url}?t=${mtime}"></video>`;
+        const vid = $("previewVideo");
+        if (vid && resumeAt != null) {
+          vid.currentTime = resumeAt;
+          vid.play().catch(() => {});
+        }
+        wirePreviewClipHighlight(vid, tabs);
       }
     }
 
@@ -849,7 +951,8 @@
         const bust = v.mtime || Date.now();
         const stem = v.stem || String(v.name || "").replace(/\.mp4$/i, "");
         const beatId = /^(\d+)_(.+)$/.exec(stem)?.[2] || stem;
-        return `<div class="card clip-card" data-stem="${esc(stem)}" data-name="${esc(v.name)}" data-beat="${esc(beatId)}">
+        const dur = Number(v.durationSec) || 0;
+        return `<div class="card clip-card" data-stem="${esc(stem)}" data-name="${esc(v.name)}" data-beat="${esc(beatId)}" data-duration="${dur}">
         <video controls src="${v.url}?t=${bust}"></video>
         <div class="cap">${esc(v.name)}${v.mtime ? ` · ${new Date(v.mtime).toLocaleTimeString()}` : ""}</div>
         <div class="kf-actions">
@@ -860,15 +963,148 @@
       .join("");
   }
 
+  function wirePreviewClipHighlight(vid, tabs) {
+    if (!vid) return;
+    const videos = tabs?.clips?.videos || [];
+    if (!videos.length) return;
+
+    // Build cumulative timeline from clip durations when present; else equal split
+    const durs = videos.map((v) => {
+      const d = Number(v.durationSec);
+      return d > 0 ? d : 0;
+    });
+    const known = durs.filter((d) => d > 0);
+    const avg =
+      known.length > 0
+        ? known.reduce((a, b) => a + b, 0) / known.length
+        : 5;
+    const spans = durs.map((d) => (d > 0 ? d : avg));
+    const ends = [];
+    let t = 0;
+    for (const s of spans) {
+      t += s;
+      ends.push(t);
+    }
+
+    const update = () => {
+      const ct = vid.currentTime || 0;
+      let idx = ends.findIndex((end) => ct < end - 0.01);
+      if (idx < 0) idx = videos.length - 1;
+      document.querySelectorAll("#clipsGrid .clip-card").forEach((card, i) => {
+        card.classList.toggle("is-playing", i === idx);
+      });
+      const active = document.querySelector("#clipsGrid .clip-card.is-playing");
+      if (active && !vid.paused) {
+        const rect = active.getBoundingClientRect();
+        const parent = $("clipsGrid");
+        if (parent && (rect.top < parent.getBoundingClientRect().top || rect.bottom > parent.getBoundingClientRect().bottom + 80)) {
+          active.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      }
+    };
+
+    vid.addEventListener("timeupdate", update);
+    vid.addEventListener("play", update);
+    vid.addEventListener("seeked", update);
+    vid.addEventListener("pause", () => {
+      /* keep highlight on last frame */
+    });
+  }
+
   function renderFinal(tabs) {
     const el = $("finalPlayer");
+    const ytEl = $("youtubePackage");
     if (!tabs?.final?.url) {
       el.className = "empty";
       el.textContent = "No final yet";
+      if (ytEl) {
+        ytEl.hidden = true;
+        ytEl.className = "yt-package empty";
+        ytEl.innerHTML = "";
+      }
       return;
     }
     el.className = "";
     el.innerHTML = `<video controls src="${tabs.final.url}?t=${Date.now()}"></video>`;
+    if (!ytEl) return;
+    const yt = tabs.final.youtube;
+    if (!yt?.title) {
+      ytEl.hidden = false;
+      ytEl.className = "yt-package";
+      ytEl.innerHTML = `
+        <div class="yt-actions">
+          <button type="button" id="btnYtPackage" class="btn">Build YouTube package</button>
+          <button type="button" id="btnYtDownload" class="btn primary">Download</button>
+          <span id="ytExportMsg" class="muted"></span>
+        </div>`;
+      wireYtButtons();
+      return;
+    }
+    ytEl.hidden = false;
+    ytEl.className = "yt-package";
+    const thumb = yt.thumbnailUrl
+      ? `<img class="yt-thumb" src="${yt.thumbnailUrl}?t=${Date.now()}" alt="YouTube thumbnail"/>`
+      : "";
+    ytEl.innerHTML = `
+      <div class="yt-grid">
+        ${thumb}
+        <div class="yt-meta">
+          <h3>YouTube</h3>
+          <p class="yt-title"><strong>Title</strong><br/>${escapeHtml(yt.title)}</p>
+          <p class="yt-desc"><strong>Description</strong></p>
+          <pre class="yt-desc-body">${escapeHtml(yt.description || "")}</pre>
+          <div class="yt-actions">
+            <button type="button" id="btnYtDownload" class="btn primary">Download</button>
+            <span id="ytExportMsg" class="muted"></span>
+          </div>
+        </div>
+      </div>`;
+    wireYtButtons();
+  }
+
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function wireYtButtons() {
+    const dl = $("btnYtDownload");
+    const build = $("btnYtPackage");
+    const msg = $("ytExportMsg");
+    if (dl && !dl._wired) {
+      dl._wired = true;
+      dl.addEventListener("click", async () => {
+        if (msg) msg.textContent = "Exporting…";
+        try {
+          const r = await fetch("/api/export-youtube", { method: "POST" });
+          const j = await r.json();
+          if (!j.ok) throw new Error(j.error || "export failed");
+          if (msg) msg.textContent = `Saved → ${j.dest}`;
+          log(`Downloaded package → ${j.dest}`);
+        } catch (err) {
+          if (msg) msg.textContent = err.message || String(err);
+        }
+      });
+    }
+    if (build && !build._wired) {
+      build._wired = true;
+      build.addEventListener("click", async () => {
+        if (msg) msg.textContent = "Building…";
+        try {
+          const r = await fetch("/api/youtube-package", { method: "POST" });
+          const j = await r.json();
+          if (!j.ok) throw new Error(j.error || "package failed");
+          const st = await fetch("/api/state").then((x) => x.json());
+          applyState(st);
+          if (msg) msg.textContent = "Package ready";
+        } catch (err) {
+          if (msg) msg.textContent = err.message || String(err);
+        }
+      });
+    }
   }
 
   function renderAll(tabs, { force = false } = {}) {
@@ -886,7 +1122,7 @@
   function applyState(s, { jumpProgress = false } = {}) {
     const prevSong = state.songDir;
     Object.assign(state, s);
-    if (s.progress) state.progress = s.progress;
+    if (s.progress != null) state.progress = s.progress;
     if (s.statusMessage) statusMsg.textContent = s.statusMessage;
     if (s.stage) stagePill.textContent = s.stage;
     if (typeof s.autoApprove === "boolean") autoApprove.checked = s.autoApprove;
@@ -909,7 +1145,9 @@
       const opt = [...$("batchPicker").options].find((o) => o.value === s.songDir);
       if (opt) $("batchPicker").value = s.songDir;
     }
-    const songChanged = !!(s.songDir && s.songDir !== prevSong);
+    const songChanged =
+      Object.prototype.hasOwnProperty.call(s, "songDir") &&
+      s.songDir !== prevSong;
     if (s.tabs) {
       state.tabs = s.tabs;
       renderAll(s.tabs, {
@@ -933,13 +1171,20 @@
       setupLoaded = false;
     }
     if (setupLoaded && s.setup?.locationsExplicit && setupScenesCache.length) {
-      renderRoomCards(setupScenesCache, s.setup.locationIds || [], {
+      // Don't wipe a live UI selection with an empty server list
+      const liveIds = [
+        ...document.querySelectorAll("#setupScenesList .room-card.is-on"),
+      ].map((el) => el.dataset.id);
+      const ids =
+        s.setup.locationIds?.length
+          ? s.setup.locationIds
+          : liveIds.length
+            ? liveIds
+            : [];
+      renderRoomCards(setupScenesCache, ids, {
         explicit: true,
       });
-      if (s.setup.title != null && $("setupTitle")) $("setupTitle").value = s.setup.title;
-      if (s.setup.objective != null && $("setupObjective"))
-        $("setupObjective").value = s.setup.objective;
-      if (s.setup.theme != null && $("setupTheme")) $("setupTheme").value = s.setup.theme;
+      applyBriefToForm(s.setup);
     } else {
       loadSetupLists();
     }
@@ -1149,23 +1394,62 @@
   });
 
   $("btnNewProject")?.addEventListener("click", async () => {
-    if (
-      !confirm(
-        "Start a brand-new project? Your current batch stays on disk; this only switches the active session.",
-      )
-    ) {
-      return;
+    const reshuffle = state.stage === "await_setup";
+    const setupPayload = collectSetupPayload();
+    if (!reshuffle) {
+      if (
+        !confirm(
+          "Start a brand-new project with a fresh title & theme? Your current batch stays on disk.",
+        )
+      ) {
+        return;
+      }
+      try {
+        localStorage.removeItem("mvid-setup-draft");
+      } catch {
+        /* ignore */
+      }
+      setupLoaded = false;
     }
-    try {
-      localStorage.removeItem("mvid-setup-draft");
-    } catch {
-      /* ignore */
-    }
-    setupLoaded = false;
-    const res = await fetch("/api/new-project", { method: "POST" });
+    const res = await fetch("/api/new-project", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(setupPayload),
+    });
     const data = await res.json();
-    if (!data.ok) log(`New project failed: ${data.error}`);
-    else log("Starting new project…");
+    if (!data.ok) return log(`New project failed: ${data.error}`);
+    if (data.brief || data.setup) {
+      state.setup = { ...(state.setup || {}), ...(data.setup || data.brief) };
+      applyBriefToForm(data.setup || data.brief);
+      // Keep the rooms the user had selected (don't let empty server wipe UI)
+      if (setupPayload.locationIds?.length && $("setupScenesList")) {
+        renderRoomCards(setupScenesCache, setupPayload.locationIds, {
+          explicit: true,
+        });
+        state.setup.locationIds = setupPayload.locationIds;
+        state.setup.locationsExplicit = true;
+      }
+    }
+    if (data.reshuffled) {
+      scheduleSetupSave();
+      log(`New brief: “${data.brief?.title || "?"}”`);
+    } else {
+      log(`Starting new project — “${data.brief?.title || "…"}”`);
+    }
+  });
+
+  $("btnShuffleBrief")?.addEventListener("click", async () => {
+    const res = await fetch("/api/suggest-brief", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!data.ok) return log(`Shuffle failed: ${data.error}`);
+    state.setup = { ...(state.setup || {}), ...(data.setup || data.brief) };
+    applyBriefToForm(data.setup || data.brief);
+    scheduleSetupSave();
+    log(`Shuffled brief: “${data.brief?.title || "?"}”`);
   });
 
   $("btnPause")?.addEventListener("click", async () => {
@@ -1323,13 +1607,1145 @@
         role: $("newCharRole").value,
         appearance: $("newCharAppearance").value,
         outfit: $("newCharOutfit").value,
+        negative: $("newCharNegative")?.value || "",
+        styleTag: $("newCharStyle")?.value || "",
+        age: window.__newCharAge || "",
       }),
     });
     const data = await res.json();
     if (!data.ok) return log(`Create character failed: ${data.error}`);
-    log(`Created character ${data.character.id}`);
+    log(`Created character ${data.character.id} — open Character studio to generate master`);
+    $("newCharName").value = "";
+    $("newCharAppearance").value = "";
+    $("newCharOutfit").value = "";
+    if ($("newCharNegative")) $("newCharNegative").value = "";
+    if ($("newCharStyle")) $("newCharStyle").value = "";
+    window.__newCharAge = "";
     setupLoaded = false;
     await loadSetupLists();
+    if ($("studioCharSelect")) {
+      $("studioCharSelect").value = data.character.id;
+      await loadStudioCharacter(data.character.id);
+    }
+  });
+
+  let studioId = "";
+  let studioPoll = null;
+  let roomPoll = null;
+  let characterPresets = [];
+  let roomPresets = [];
+
+  function fillStudioSelect(list) {
+    const sel = $("studioCharSelect");
+    if (!sel) return;
+    const prev = sel.value || studioId;
+    sel.innerHTML =
+      `<option value="">Select…</option>` +
+      (list || [])
+        .map(
+          (c) =>
+            `<option value="${esc(c.id)}">${esc(c.name || c.id)}</option>`,
+        )
+        .join("");
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+  }
+
+  function renderPresetChips(containerId, presets, onPick) {
+    const el = $(containerId);
+    if (!el) return;
+    el.innerHTML = (presets || [])
+      .map(
+        (p) =>
+          `<button type="button" class="preset-chip" data-preset="${esc(p.id)}">${esc(p.label)}</button>`,
+      )
+      .join("");
+    el.onclick = (ev) => {
+      const btn = ev.target.closest(".preset-chip");
+      if (!btn) return;
+      const preset = (presets || []).find((p) => p.id === btn.dataset.preset);
+      if (preset) onPick(preset);
+    };
+  }
+
+  function applyCharPreset(preset, target) {
+    if (!preset) return;
+    if (target === "new") {
+      if ($("newCharRole")) $("newCharRole").value = preset.role || "toddler";
+      if ($("newCharAppearance")) $("newCharAppearance").value = preset.appearance || "";
+      if ($("newCharOutfit")) $("newCharOutfit").value = preset.outfit || "";
+      if ($("newCharNegative")) $("newCharNegative").value = preset.negative || "";
+      if ($("newCharStyle")) $("newCharStyle").value = preset.styleTag || "";
+      window.__newCharAge = preset.age || "";
+      if (!$("newCharName")?.value?.trim()) {
+        $("newCharName").value = preset.label;
+      }
+    } else {
+      if ($("studioAppearance")) $("studioAppearance").value = preset.appearance || "";
+      if ($("studioOutfit")) $("studioOutfit").value = preset.outfit || "";
+      if ($("studioNegative")) $("studioNegative").value = preset.negative || "";
+      if ($("studioStyleTag")) $("studioStyleTag").value = preset.styleTag || "";
+      if ($("studioAge")) $("studioAge").value = preset.age || "";
+    }
+    log(`Filled ${preset.label} prompts`);
+  }
+
+  async function loadPresets() {
+    try {
+      const [cRes, rRes] = await Promise.all([
+        fetch("/api/character-presets"),
+        fetch("/api/room-presets"),
+      ]);
+      const cData = await cRes.json();
+      const rData = await rRes.json();
+      if (cData.ok) {
+        characterPresets = cData.presets || [];
+        renderPresetChips("newCharPresets", characterPresets, (p) =>
+          applyCharPreset(p, "new"),
+        );
+        renderPresetChips("studioPresets", characterPresets, (p) =>
+          applyCharPreset(p, "studio"),
+        );
+      }
+      if (rData.ok) {
+        roomPresets = rData.presets || [];
+        renderPresetChips("roomPresets", roomPresets, (p) => {
+          if ($("newRoomName")) $("newRoomName").value = p.name || p.label;
+          if ($("newRoomId")) $("newRoomId").value = p.id || "";
+          if ($("newRoomStill")) $("newRoomStill").value = p.still || "";
+          log(`Filled room preset: ${p.label}`);
+        });
+      }
+    } catch (err) {
+      console.warn("preset load failed", err);
+    }
+  }
+  loadPresets();
+
+  function toast(message, kind = "") {
+    const stack = $("toastStack");
+    if (!stack) {
+      log(message);
+      return;
+    }
+    const el = document.createElement("div");
+    el.className = `toast${kind ? ` is-${kind}` : ""}`;
+    el.textContent = message;
+    stack.appendChild(el);
+    setTimeout(() => {
+      el.remove();
+    }, 6500);
+    log(message);
+  }
+
+  function setStudioBusy(busy) {
+    for (const id of [
+      "btnStudioSave",
+      "btnStudioMaster",
+      "btnStudioApprove",
+      "btnStudioDataset",
+      "btnStudioTrain",
+      "btnStudioFaceRef",
+      "btnStudioStill",
+      "btnStudioDescribe",
+      "studioCharSelect",
+      "studioMasterCount",
+    ]) {
+      const el = $(id);
+      if (el) el.disabled = !!busy;
+    }
+  }
+
+  function updateStudioBanner(job, { forceIdle = false, dataset = null } = {}) {
+    const banner = $("studioBanner");
+    const title = $("studioBannerTitle");
+    const sub = $("studioBannerSub");
+    const spin = $("studioBannerSpin");
+    if (!banner || !title) return;
+    if (forceIdle || !job) {
+      banner.hidden = true;
+      banner.classList.remove("is-error", "is-ok");
+      if (spin) spin.hidden = true;
+      return;
+    }
+    banner.hidden = false;
+    banner.classList.toggle("is-error", !job.running && job.exitCode !== 0);
+    banner.classList.toggle("is-ok", !job.running && job.exitCode === 0);
+    if (spin) spin.hidden = !job.running;
+    const progressLabel = dataset?.progress?.label;
+    if (job.running) {
+      title.textContent = progressLabel
+        ? `${job.label || "Job"} — ${progressLabel}`
+        : `${job.label || "Job"} running…`;
+      const last = (job.log || []).slice(-1)[0]?.line || "Working on local Comfy…";
+      if (sub) sub.textContent = last;
+    } else if (job.exitCode === 0) {
+      title.textContent = `${job.label || "Job"} finished`;
+      if (sub) {
+        sub.textContent = progressLabel
+          ? `${progressLabel} ready`
+          : "Refresh below — dataset thumbs appear when images are ready.";
+      }
+    } else {
+      title.textContent = `${job.label || "Job"} failed`;
+      const errLine =
+        job.error ||
+        (job.log || []).slice().reverse().find((l) => /fail|error/i.test(l.line || ""))?.line ||
+        `Exit code ${job.exitCode}`;
+      if (sub) sub.textContent = errLine;
+    }
+  }
+
+  function renderStudioJob(job, dataset = null) {
+    const logEl = $("studioLog");
+    const hint = $("studioLogHint");
+    if (!logEl) return;
+    updateStudioBanner(job, { dataset });
+    if (!job) {
+      logEl.textContent = "Select a character, then generate.";
+      if (hint) hint.textContent = "Live job output";
+      return;
+    }
+    const lines = (job.log || []).slice(-60).map((l) => l.line);
+    logEl.textContent = [
+      `${job.label || "Job"}${job.running ? "…" : job.exitCode === 0 ? " ✓" : ` (exit ${job.exitCode})`}`,
+      dataset?.progress?.label ? `Progress: ${dataset.progress.label}` : "",
+      ...lines,
+      job.error ? `ERROR: ${job.error}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    logEl.scrollTop = logEl.scrollHeight;
+    if (hint) {
+      hint.textContent = job.running
+        ? dataset?.progress?.label || "Updating live…"
+        : job.exitCode === 0
+          ? "Completed"
+          : "Failed — see ERROR line";
+    }
+  }
+
+  function renderCandidates(list) {
+    const el = $("studioCandidates");
+    if (!el) return;
+    const items = list || [];
+    if (!items.length) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    el.hidden = false;
+    el.innerHTML = items
+      .map(
+        (c, i) =>
+          `<button type="button" class="studio-cand" data-file="${esc(c.file)}" title="Use this master">
+            <img src="${esc(c.url)}" alt="Candidate ${i + 1}" loading="lazy" />
+            <span class="studio-cand-label">Pick ${i + 1}</span>
+          </button>`,
+      )
+      .join("");
+  }
+
+  let activeShotId = "";
+  let studioDatasetImages = [];
+  let studioSlideshow = [];
+  let studioSlideshowIndex = 0;
+  let studioSlideshowRemaking = false;
+
+  function closeShotEditor() {
+    activeShotId = "";
+    const ed = $("shotEditor");
+    if (ed) ed.hidden = true;
+    document
+      .querySelectorAll(".studio-dataset-tile.is-active")
+      .forEach((el) => el.classList.remove("is-active"));
+  }
+
+  function openShotEditor(img) {
+    if (!img?.editable || !img.shot) {
+      toast("This file isn’t an editable training shot", "error");
+      return;
+    }
+    activeShotId = img.shotId;
+    studioDatasetImages = studioDatasetImages || [];
+    const ed = $("shotEditor");
+    if (!ed) return;
+    ed.hidden = false;
+    if ($("shotEditorImg")) $("shotEditorImg").src = img.url;
+    if ($("shotEditorTitle")) $("shotEditorTitle").textContent = img.shotId;
+    if ($("shotEditorFile")) $("shotEditorFile").textContent = img.file;
+    const s = img.shot;
+    if ($("shotPose")) $("shotPose").value = s.pose || "";
+    if ($("shotAngle")) $("shotAngle").value = s.angle || "";
+    if ($("shotCaptionExtra")) $("shotCaptionExtra").value = s.captionExtra || "";
+    if ($("shotAngleKey")) $("shotAngleKey").value = s.angleKey || "front";
+    if ($("shotPoseKey")) $("shotPoseKey").value = s.poseKey || "stand";
+    if ($("shotExpression")) $("shotExpression").value = s.expression || "neutral";
+    if ($("shotBust")) $("shotBust").checked = !!s.bust;
+    if ($("shotAppearance")) $("shotAppearance").value = s.appearance || "";
+    if ($("shotOutfit")) $("shotOutfit").value = s.outfit || "";
+    if ($("shotNegative")) $("shotNegative").value = s.negative || "";
+    if ($("shotExtraNegative")) $("shotExtraNegative").value = s.extraNegative || "";
+    document.querySelectorAll(".studio-dataset-tile").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.shotId === img.shotId);
+    });
+    ed.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function readShotEditorPatch() {
+    return {
+      pose: $("shotPose")?.value || "",
+      angle: $("shotAngle")?.value || "",
+      captionExtra: $("shotCaptionExtra")?.value || "",
+      angleKey: $("shotAngleKey")?.value || "front",
+      poseKey: $("shotPoseKey")?.value || "stand",
+      expression: $("shotExpression")?.value || "neutral",
+      bust: !!$("shotBust")?.checked,
+      appearance: $("shotAppearance")?.value || "",
+      outfit: $("shotOutfit")?.value || "",
+      negative: $("shotNegative")?.value || "",
+      extraNegative: $("shotExtraNegative")?.value || "",
+    };
+  }
+
+  function buildSlideshowItems(dataset) {
+    const keyframes = dataset?.keyframes || [];
+    const images = dataset?.images || [];
+    const items = [];
+    for (const img of keyframes) {
+      items.push({
+        kind: "keyframe",
+        id: img.id || String(img.file || "").replace(/\.[^.]+$/, ""),
+        file: img.file,
+        url: img.url,
+        label: img.id || img.file,
+        gateFail: Boolean(img.gateFail),
+      });
+    }
+    for (const img of images) {
+      items.push({
+        kind: "shot",
+        id: img.shotId || String(img.file || "").replace(/\.[^.]+$/, ""),
+        file: img.file,
+        url: img.url,
+        label: img.shotId || img.file,
+        editable: Boolean(img.editable),
+        shot: img.shot || null,
+        gateFail: Boolean(img.gateFail),
+      });
+    }
+    return items;
+  }
+
+  function syncLightboxUi() {
+    const box = $("datasetLightbox");
+    if (!box || box.hidden) return;
+    const item = studioSlideshow[studioSlideshowIndex];
+    if (!item) return;
+    const img = $("datasetLightboxImg");
+    const cap = $("datasetLightboxCaption");
+    const hint = $("datasetLightboxHint");
+    const busy = $("datasetLightboxBusy");
+    const remake = $("btnLightboxRemake");
+    const edit = $("btnLightboxEdit");
+    if (img) img.src = item.url;
+    if (cap) {
+      cap.textContent = `${item.label} · ${item.kind} · ${studioSlideshowIndex + 1} / ${studioSlideshow.length}`;
+    }
+    if (hint) {
+      hint.textContent = item.gateFail
+        ? "Gate failed on this plate — Remake recommended."
+        : item.kind === "keyframe"
+          ? item.id === "front"
+            ? "front remakes by re-copying the approved master."
+            : "Remake regenerates this keyframe from the nearest source."
+          : "Remake regenerates this training shot.";
+    }
+    if (busy) busy.hidden = !studioSlideshowRemaking;
+    if (remake) remake.disabled = studioSlideshowRemaking;
+    if (edit) {
+      edit.hidden = !(item.kind === "shot" && item.editable);
+      edit.disabled = studioSlideshowRemaking;
+    }
+  }
+
+  function openDatasetSlideshow(index = 0) {
+    if (!studioSlideshow.length) return;
+    studioSlideshowIndex = Math.max(0, Math.min(index, studioSlideshow.length - 1));
+    const box = $("datasetLightbox");
+    if (box) box.hidden = false;
+    syncLightboxUi();
+  }
+
+  function closeDatasetSlideshow() {
+    const box = $("datasetLightbox");
+    if (box) box.hidden = true;
+    studioSlideshowRemaking = false;
+    syncLightboxUi();
+  }
+
+  function stepDatasetSlideshow(delta) {
+    if (!studioSlideshow.length) return;
+    const n = studioSlideshow.length;
+    studioSlideshowIndex = (studioSlideshowIndex + delta + n) % n;
+    syncLightboxUi();
+  }
+
+  async function remakeSlideshowItem(item) {
+    if (!studioId || !item || studioSlideshowRemaking) return;
+    studioSlideshowRemaking = true;
+    syncLightboxUi();
+    toast(`Remaking ${item.label}…`);
+    try {
+      let res;
+      if (item.kind === "keyframe") {
+        res = await fetch(
+          `/api/characters/${encodeURIComponent(studioId)}/keyframes/${encodeURIComponent(item.id)}/regenerate`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+        );
+      } else {
+        res = await fetch(
+          `/api/characters/${encodeURIComponent(studioId)}/shots/${encodeURIComponent(item.id)}/regenerate`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          },
+        );
+      }
+      const data = await res.json();
+      if (!data.ok) {
+        toast(`Remake failed: ${data.error}`, "error");
+        studioSlideshowRemaking = false;
+        syncLightboxUi();
+        return;
+      }
+      if (data.copied) {
+        toast(`front.png re-copied from master`, "ok");
+        studioSlideshowRemaking = false;
+        await refreshStudioStatus();
+        // refresh current slide URL after status
+        const refreshed = studioSlideshow[studioSlideshowIndex];
+        if (refreshed && $("datasetLightboxImg")) {
+          $("datasetLightboxImg").src = refreshed.url;
+        }
+        syncLightboxUi();
+        return;
+      }
+      if (data.job) {
+        renderStudioJob(data.job);
+        setStudioBusy(true);
+        startStudioPoll();
+      }
+    } catch (err) {
+      toast(`Remake error: ${err.message || err}`, "error");
+      studioSlideshowRemaking = false;
+      syncLightboxUi();
+    }
+  }
+
+  function renderDatasetGrid(dataset, { jobRunning = false } = {}) {
+    const grid = $("studioDatasetGrid");
+    const meta = $("studioDatasetMeta");
+    const prog = $("studioDatasetProgress");
+    const progFill = $("studioDatasetProgressFill");
+    const progText = $("studioDatasetProgressText");
+    if (!grid) return;
+    const images = dataset?.images || [];
+    const keyframes = dataset?.keyframes || [];
+    studioDatasetImages = images;
+    const prevId = studioSlideshow[studioSlideshowIndex]?.id;
+    const prevKind = studioSlideshow[studioSlideshowIndex]?.kind;
+    studioSlideshow = buildSlideshowItems(dataset);
+    if (prevId) {
+      const idx = studioSlideshow.findIndex(
+        (x) => x.id === prevId && x.kind === prevKind,
+      );
+      if (idx >= 0) studioSlideshowIndex = idx;
+    }
+    // Job finished while remaking — clear busy and refresh lightbox image
+    if (studioSlideshowRemaking && !jobRunning) {
+      studioSlideshowRemaking = false;
+    }
+    if (!$("datasetLightbox")?.hidden) syncLightboxUi();
+
+    const count = dataset?.trainingImageCount ?? dataset?.imageCount ?? images.length ?? 0;
+    const shotTotal = dataset?.shotCount || 0;
+    const kf = dataset?.keyframeCount || 0;
+    const kfTotal = dataset?.keyframeTotal || 0;
+    const progress = dataset?.progress || {};
+    const phase = progress.phase || (count > 0 ? "shots" : "keyframes");
+
+    if (meta) {
+      const parts = [];
+      if (progress.label) parts.push(progress.label);
+      else parts.push(`${count} images`);
+      if (kfTotal) parts.push(`${kf} / ${kfTotal} keyframes`);
+      else if (kf) parts.push(`${kf} keyframes`);
+      if (dataset?.ready) parts.push("ready");
+      if (jobRunning) parts.push("generating…");
+      meta.textContent = parts.join(" · ");
+    }
+
+    if (prog && progFill && progText) {
+      const overallTotal = Number(progress.overallTotal) || (kfTotal + shotTotal) || shotTotal || kfTotal;
+      const overallDone = Number(progress.overallDone);
+      const done =
+        Number.isFinite(overallDone)
+          ? overallDone
+          : phase === "keyframes"
+            ? kf
+            : count;
+      const total = overallTotal || Number(progress.total) || 0;
+      if (total > 0) {
+        prog.hidden = false;
+        const pct = Math.round((Math.min(done, total) / total) * 100);
+        progFill.style.width = `${pct}%`;
+        progText.textContent =
+          progress.label ||
+          (phase === "keyframes"
+            ? `${kf} / ${kfTotal || total}`
+            : `${count} / ${shotTotal || total}`);
+      } else {
+        prog.hidden = !jobRunning;
+      }
+    }
+
+    const tileHtml = (item, index) => {
+      const fail = item.gateFail ? " is-gate-fail" : "";
+      return `<div class="studio-dataset-tile-wrap">
+        <button type="button" class="studio-dataset-tile${fail}" data-slide-index="${index}" title="${esc(item.label)}">
+          <img src="${esc(item.url)}" alt="${esc(item.label)}" loading="lazy" />
+          <span>${esc(item.label)}</span>
+        </button>
+        <button type="button" class="btn tiny primary tile-remake" data-remake-index="${index}">Remake</button>
+      </div>`;
+    };
+
+    const kfItems = studioSlideshow
+      .map((it, i) => ({ it, i }))
+      .filter((x) => x.it.kind === "keyframe");
+    const shotItems = studioSlideshow
+      .map((it, i) => ({ it, i }))
+      .filter((x) => x.it.kind === "shot");
+
+    const kfBlock =
+      kfItems.length > 0
+        ? `<div class="studio-dataset-section">
+            <div class="studio-dataset-section-title">Keyframes ${kf}${kfTotal ? ` / ${kfTotal}` : ""}</div>
+            <div class="studio-dataset-grid-inner">
+              ${kfItems.map(({ it, i }) => tileHtml(it, i)).join("")}
+            </div>
+          </div>`
+        : "";
+
+    const shotBlock =
+      shotItems.length > 0
+        ? `<div class="studio-dataset-section">
+            <div class="studio-dataset-section-title">Training shots ${count}${shotTotal ? ` / ${shotTotal}` : ""}</div>
+            <div class="studio-dataset-grid-inner">
+              ${shotItems.map(({ it, i }) => tileHtml(it, i)).join("")}
+            </div>
+          </div>`
+        : "";
+
+    if (!kfBlock && !shotBlock) {
+      grid.innerHTML = `<span class="meta">${
+        jobRunning
+          ? phase === "keyframes"
+            ? "Building keyframe bank…"
+            : "Waiting for first training shot…"
+          : "No training images yet"
+      }</span>`;
+      if (!jobRunning) closeShotEditor();
+      return;
+    }
+
+    grid.innerHTML = `${kfBlock}${shotBlock}${
+      jobRunning && phase === "keyframes" && !shotBlock
+        ? `<p class="meta">Keyframe bank first — training shots start after ${kfTotal || "all"} keyframes.</p>`
+        : ""
+    }`;
+
+    if (activeShotId) {
+      const still = images.find((i) => i.shotId === activeShotId);
+      if (still) {
+        if ($("shotEditorImg")) $("shotEditorImg").src = still.url;
+      } else if (!jobRunning) {
+        closeShotEditor();
+      }
+    }
+  }
+
+  function renderStudioSteps(data) {
+    const root = $("studioSteps");
+    if (!root) return;
+    const m = data.master || {};
+    const d = data.dataset || {};
+    const l = data.lora || {};
+    const job = data.job;
+    const set = (step, state) => {
+      const el = root.querySelector(`[data-step="${step}"]`);
+      if (!el) return;
+      el.classList.toggle("is-done", state === "done");
+      el.classList.toggle("is-active", state === "active");
+    };
+    const masterState = m.approved
+      ? "done"
+      : job?.running && /master/i.test(job.label || "")
+        ? "active"
+        : m.exists
+          ? "active"
+          : "";
+    const datasetState = d.ready
+      ? "done"
+      : job?.running && /dataset/i.test(job.label || "")
+        ? "active"
+        : d.imageCount > 0
+          ? "active"
+          : m.approved
+            ? "active"
+            : "";
+    const trainState = l.exists
+      ? "done"
+      : job?.running && /train|lora/i.test(job.label || "")
+        ? "active"
+        : d.ready
+          ? "active"
+          : "";
+    set("master", masterState);
+    set("dataset", datasetState);
+    set("train", trainState);
+  }
+
+  function renderStudioStatus(data) {
+    const st = $("studioStatus");
+    const img = $("studioMasterImg");
+    const empty = $("studioMasterEmpty");
+    if (!st) return;
+    const m = data.master || {};
+    const d = data.dataset || {};
+    const l = data.lora || {};
+    const candCount = (data.candidates || []).length;
+    st.textContent = [
+      m.approved
+        ? "Master: approved"
+        : m.exists
+          ? "Master: pending approval"
+          : "Master: not generated",
+      candCount ? `Candidates: ${candCount} — tap one to select` : "",
+      `Dataset: ${d.imageCount || 0} images` +
+        (d.keyframeCount ? ` · ${d.keyframeCount} keyframes` : "") +
+        (d.shotCount != null ? ` · ${d.shotCount} shots` : "") +
+        (d.ready ? " (ready)" : ""),
+      l.name
+        ? `LoRA: ${l.name}${l.exists ? " (file found)" : " (not trained yet)"}`
+        : "LoRA: not set",
+      data.job?.running ? `Job: ${data.job.label}…` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    if (m.url && img) {
+      img.hidden = false;
+      if (empty) empty.hidden = true;
+      img.src = m.url;
+    } else if (img) {
+      img.hidden = true;
+      img.removeAttribute("src");
+      if (empty) empty.hidden = false;
+    }
+
+    renderCandidates(data.candidates);
+    renderDatasetGrid(d, { jobRunning: !!data.job?.running });
+    renderStudioSteps(data);
+    renderStudioUploads(data.uploads);
+
+    const approve = $("btnStudioApprove");
+    const dataset = $("btnStudioDataset");
+    const train = $("btnStudioTrain");
+    const busy = !!data.job?.running;
+    if (approve) approve.disabled = busy || !m.exists || !!m.approved;
+    if (dataset) dataset.disabled = busy || !m.approved;
+    if (train) train.disabled = busy || !(d.imageCount >= 4);
+    setStudioBusy(busy);
+    if (approve && m.approved) approve.textContent = "Approved";
+    else if (approve) approve.textContent = "Approve";
+    renderStudioJob(data.job, d);
+  }
+
+  async function loadStudioCharacter(id) {
+    studioId = id || "";
+    const body = $("studioBody");
+    const emptyHint = $("studioEmptyHint");
+    if (!id) {
+      if (body) body.hidden = true;
+      if (emptyHint) emptyHint.hidden = false;
+      return;
+    }
+    if (body) body.hidden = false;
+    if (emptyHint) emptyHint.hidden = true;
+    const res = await fetch(`/api/characters/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (!data.ok) {
+      toast(`Studio load failed: ${data.error}`, "error");
+      return;
+    }
+    const c = data.character || {};
+    if ($("studioAppearance")) $("studioAppearance").value = c.appearance || "";
+    if ($("studioOutfit")) $("studioOutfit").value = c.outfit || "";
+    if ($("studioNegative")) $("studioNegative").value = c.negative || "";
+    if ($("studioStyleTag")) $("studioStyleTag").value = c.styleTag || "";
+    if ($("studioAge")) $("studioAge").value = c.age || "";
+    if ($("studioTrigger")) $("studioTrigger").value = c.trigger || "";
+    renderStudioStatus(data);
+    if (data.job?.running) startStudioPoll();
+  }
+
+  async function refreshStudioStatus() {
+    if (!studioId) return;
+    const res = await fetch(`/api/characters/${encodeURIComponent(studioId)}`);
+    const data = await res.json();
+    if (data.ok) renderStudioStatus(data);
+  }
+
+  function startStudioPoll() {
+    if (studioPoll) return;
+    studioPoll = setInterval(async () => {
+      if (!studioId) return;
+      await refreshStudioStatus();
+      const res = await fetch(`/api/characters/${encodeURIComponent(studioId)}/job`);
+      const data = await res.json();
+      if (!data.job?.running) {
+        clearInterval(studioPoll);
+        studioPoll = null;
+        await refreshStudioStatus();
+        setupLoaded = false;
+        await loadSetupLists();
+        if (data.job) {
+          if (data.job.exitCode === 0) {
+            toast(`${data.job.label || "Job"} finished`, "ok");
+          } else {
+            const err =
+              data.job.error ||
+              (data.job.log || [])
+                .slice()
+                .reverse()
+                .find((l) => /fail|error/i.test(l.line || ""))?.line ||
+              `exit ${data.job.exitCode}`;
+            toast(`${data.job.label || "Job"} failed: ${err}`, "error");
+          }
+        }
+      }
+    }, 1200);
+  }
+
+  $("studioCharSelect")?.addEventListener("change", async (ev) => {
+    await loadStudioCharacter(ev.target.value);
+  });
+
+  $("studioCandidates")?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest(".studio-cand");
+    if (!btn || !studioId) return;
+    const file = btn.dataset.file;
+    toast(`Selecting master ${file}…`);
+    const res = await fetch(
+      `/api/characters/${encodeURIComponent(studioId)}/select-master`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file }),
+      },
+    );
+    const data = await res.json();
+    if (!data.ok) return toast(`Select failed: ${data.error}`, "error");
+    toast(`Selected ${file} — other candidates cleared`, "ok");
+    await refreshStudioStatus();
+  });
+
+  $("studioDatasetGrid")?.addEventListener("click", (ev) => {
+    const remakeBtn = ev.target.closest("[data-remake-index]");
+    if (remakeBtn) {
+      ev.preventDefault();
+      const idx = Number(remakeBtn.dataset.remakeIndex);
+      const item = studioSlideshow[idx];
+      if (!item) return;
+      openDatasetSlideshow(idx);
+      remakeSlideshowItem(item);
+      return;
+    }
+    const tile = ev.target.closest(".studio-dataset-tile");
+    if (!tile) return;
+    const idx = Number(tile.dataset.slideIndex);
+    if (!Number.isFinite(idx)) return;
+    openDatasetSlideshow(idx);
+  });
+
+  $("btnLightboxPrev")?.addEventListener("click", () => stepDatasetSlideshow(-1));
+  $("btnLightboxNext")?.addEventListener("click", () => stepDatasetSlideshow(1));
+  $("btnLightboxRemake")?.addEventListener("click", () => {
+    const item = studioSlideshow[studioSlideshowIndex];
+    if (item) remakeSlideshowItem(item);
+  });
+  $("btnLightboxEdit")?.addEventListener("click", () => {
+    const item = studioSlideshow[studioSlideshowIndex];
+    if (!item || item.kind !== "shot") return;
+    const img = (studioDatasetImages || []).find((i) => i.shotId === item.id);
+    if (img) openShotEditor(img);
+  });
+  $("datasetLightbox")?.addEventListener("click", (ev) => {
+    if (ev.target.closest("[data-lightbox-close]")) closeDatasetSlideshow();
+  });
+  document.addEventListener("keydown", (ev) => {
+    const box = $("datasetLightbox");
+    if (!box || box.hidden) return;
+    if (ev.key === "Escape") closeDatasetSlideshow();
+    if (ev.key === "ArrowLeft") stepDatasetSlideshow(-1);
+    if (ev.key === "ArrowRight") stepDatasetSlideshow(1);
+  });
+
+  $("btnShotEditorClose")?.addEventListener("click", () => closeShotEditor());
+
+  $("btnShotSave")?.addEventListener("click", async () => {
+    if (!studioId || !activeShotId) return;
+    const patch = readShotEditorPatch();
+    const res = await fetch(
+      `/api/characters/${encodeURIComponent(studioId)}/shots/${encodeURIComponent(activeShotId)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      },
+    );
+    const data = await res.json();
+    if (!data.ok) return toast(`Save shot failed: ${data.error}`, "error");
+    toast(`Saved prompts for ${activeShotId}`, "ok");
+    await refreshStudioStatus();
+  });
+
+  $("btnShotRegen")?.addEventListener("click", async () => {
+    if (!studioId || !activeShotId) return;
+    const patch = readShotEditorPatch();
+    toast(`Regenerating ${activeShotId}…`);
+    const res = await fetch(
+      `/api/characters/${encodeURIComponent(studioId)}/shots/${encodeURIComponent(activeShotId)}/regenerate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      },
+    );
+    const data = await res.json();
+    if (!data.ok) return toast(`Regen failed: ${data.error}`, "error");
+    if (data.job) {
+      renderStudioJob(data.job);
+      setStudioBusy(true);
+      startStudioPoll();
+    }
+  });
+
+  $("btnStudioSave")?.addEventListener("click", async () => {
+    if (!studioId) return;
+    const res = await fetch(`/api/characters/${encodeURIComponent(studioId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        appearance: $("studioAppearance")?.value || "",
+        outfit: $("studioOutfit")?.value || "",
+        negative: $("studioNegative")?.value || "",
+        styleTag: $("studioStyleTag")?.value || "",
+        age: $("studioAge")?.value || "",
+        trigger: $("studioTrigger")?.value || "",
+      }),
+    });
+    const data = await res.json();
+    log(data.ok ? `Saved ${studioId} prompts` : `Save failed: ${data.error}`);
+  });
+
+  async function postStudioAction(path, label, body = {}) {
+    if (!studioId) return;
+    toast(`${label}…`);
+    const res = await fetch(
+      `/api/characters/${encodeURIComponent(studioId)}${path}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    const data = await res.json();
+    if (!data.ok) {
+      toast(`${label} failed: ${data.error}`, "error");
+      return;
+    }
+    if (data.job) {
+      renderStudioJob(data.job);
+      setStudioBusy(true);
+      startStudioPoll();
+    } else {
+      await refreshStudioStatus();
+      toast(`${label} done`, "ok");
+    }
+  }
+
+  function renderStudioUploads(uploads) {
+    const u = uploads || {};
+    const faceImg = $("studioFaceRefPreview");
+    const faceStatus = $("studioFaceRefStatus");
+    const stillImg = $("studioStillPreview");
+    const stillStatus = $("studioStillStatus");
+    if (faceImg) {
+      if (u.faceRefUrl) {
+        faceImg.hidden = false;
+        faceImg.src = u.faceRefUrl;
+      } else {
+        faceImg.hidden = true;
+        faceImg.removeAttribute("src");
+      }
+    }
+    if (faceStatus) {
+      faceStatus.textContent = u.faceRef ? "Face ref saved" : "";
+    }
+    if (stillImg) {
+      if (u.cartoonStillUrl) {
+        stillImg.hidden = false;
+        stillImg.src = u.cartoonStillUrl;
+      } else {
+        stillImg.hidden = true;
+        stillImg.removeAttribute("src");
+      }
+    }
+    if (stillStatus) {
+      stillStatus.textContent = u.cartoonStill ? "Still uploaded" : "";
+    }
+  }
+
+  function fileToBase64Payload(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const m = /^data:([^;]+);base64,(.+)$/i.exec(result);
+        if (!m) return reject(new Error("Invalid image data"));
+        const mime = m[1].toLowerCase();
+        let ext = "png";
+        if (mime.includes("jpeg") || mime.includes("jpg")) ext = "jpg";
+        else if (mime.includes("webp")) ext = "webp";
+        else if (mime.includes("png")) ext = "png";
+        resolve({ imageBase64: m[2], ext, mime });
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function applyDescribedFields(fields) {
+    if (!fields) return;
+    if (fields.appearance != null && $("studioAppearance")) {
+      $("studioAppearance").value = fields.appearance;
+    }
+    if (fields.outfit != null && $("studioOutfit")) {
+      $("studioOutfit").value = fields.outfit;
+    }
+    if (fields.styleTag != null && $("studioStyleTag")) {
+      $("studioStyleTag").value = fields.styleTag;
+    }
+    if (fields.age != null && $("studioAge")) {
+      $("studioAge").value = fields.age;
+    }
+    if (fields.negative != null && $("studioNegative")) {
+      $("studioNegative").value = fields.negative;
+    }
+  }
+
+  async function uploadStudioMaster(kind, file) {
+    if (!studioId) return toast("Select a character first", "error");
+    if (!file) return;
+    try {
+      const payload = await fileToBase64Payload(file);
+      const count = Number($("studioMasterCount")?.value || 2);
+      const label =
+        kind === "face_ref"
+          ? `Invent master(s) from face photo`
+          : `Install cartoon still as master`;
+      toast(`${label}… (describing image for outfit/style lock)`);
+      setStudioBusy(true);
+      const res = await fetch(
+        `/api/characters/${encodeURIComponent(studioId)}/master-upload`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind,
+            imageBase64: payload.imageBase64,
+            ext: payload.ext,
+            force: true,
+            count,
+            autofill: true,
+          }),
+        },
+      );
+      const data = await res.json();
+      if (!data.ok) {
+        setStudioBusy(false);
+        return toast(`${label} failed: ${data.error}`, "error");
+      }
+      if (data.describe?.ok && data.describe.fields) {
+        applyDescribedFields(data.describe.fields);
+        toast(
+          `Prompts autofilled from image (${data.describe.model || "vision"})`,
+          "ok",
+        );
+      } else if (data.describe && !data.describe.ok) {
+        toast(
+          `Upload OK — prompt autofill skipped: ${data.describe.error}`,
+          "error",
+        );
+      }
+      if (data.job) {
+        renderStudioJob(data.job);
+        startStudioPoll();
+      } else {
+        await refreshStudioStatus();
+        toast(`${label} done`, "ok");
+      }
+    } catch (err) {
+      setStudioBusy(false);
+      toast(err.message || String(err), "error");
+    }
+  }
+
+  $("btnStudioDescribe")?.addEventListener("click", async () => {
+    if (!studioId) return toast("Select a character first", "error");
+    const st = $("studioDescribeStatus");
+    if (st) st.textContent = "Describing…";
+    toast("Autofilling prompts from image…");
+    setStudioBusy(true);
+    try {
+      const res = await fetch(
+        `/api/characters/${encodeURIComponent(studioId)}/describe`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ source: "auto", save: true }),
+        },
+      );
+      const data = await res.json();
+      setStudioBusy(false);
+      if (!data.ok) {
+        if (st) st.textContent = "Failed";
+        return toast(`Describe failed: ${data.error}`, "error");
+      }
+      applyDescribedFields(data.fields);
+      if (st) st.textContent = `Filled via ${data.model || "vision"}`;
+      toast("Prompts autofilled — review Appearance / Outfit, then Save", "ok");
+      await refreshStudioStatus();
+    } catch (err) {
+      setStudioBusy(false);
+      if (st) st.textContent = "Failed";
+      toast(err.message || String(err), "error");
+    }
+  });
+
+  $("btnStudioMaster")?.addEventListener("click", () => {
+    const count = Number($("studioMasterCount")?.value || 1);
+    postStudioAction("/master", `Generate ${count} master(s)`, {
+      force: true,
+      count,
+    });
+  });
+  $("btnStudioFaceRef")?.addEventListener("click", () => {
+    $("studioFaceRefFile")?.click();
+  });
+  $("studioFaceRefFile")?.addEventListener("change", async (ev) => {
+    const file = ev.target.files?.[0];
+    ev.target.value = "";
+    await uploadStudioMaster("face_ref", file);
+  });
+  $("btnStudioStill")?.addEventListener("click", () => {
+    $("studioStillFile")?.click();
+  });
+  $("studioStillFile")?.addEventListener("change", async (ev) => {
+    const file = ev.target.files?.[0];
+    ev.target.value = "";
+    await uploadStudioMaster("set_master", file);
+  });
+  $("btnStudioApprove")?.addEventListener("click", () =>
+    postStudioAction("/approve-master", "Approve master"),
+  );
+  $("btnStudioDataset")?.addEventListener("click", () =>
+    postStudioAction("/dataset", "Generate dataset"),
+  );
+  $("btnStudioTrain")?.addEventListener("click", () =>
+    postStudioAction("/train", "Train LoRA"),
+  );
+
+  function renderRoomJob(job) {
+    const logEl = $("roomLog");
+    if (!logEl) return;
+    if (!job) {
+      logEl.hidden = true;
+      logEl.textContent = "";
+      return;
+    }
+    logEl.hidden = false;
+    const lines = (job.log || []).slice(-30).map((l) => l.line);
+    logEl.textContent = [
+      `${job.label || "Room job"}${job.running ? "…" : job.exitCode === 0 ? " ✓" : ` (exit ${job.exitCode})`}`,
+      ...lines,
+      job.error ? `ERROR: ${job.error}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function startRoomPoll(roomId) {
+    if (roomPoll) clearInterval(roomPoll);
+    roomPoll = setInterval(async () => {
+      const res = await fetch(`/api/scenes/${encodeURIComponent(roomId)}/job`);
+      const data = await res.json();
+      renderRoomJob(data.job);
+      if (!data.job?.running) {
+        clearInterval(roomPoll);
+        roomPoll = null;
+        setupLoaded = false;
+        await loadSetupLists();
+        log(
+          data.job?.exitCode === 0
+            ? `Room ${roomId} plate ready`
+            : `Room ${roomId} generate finished with errors`,
+        );
+      }
+    }, 2500);
+  }
+
+  $("btnCreateRoom")?.addEventListener("click", async () => {
+    const name = $("newRoomName")?.value?.trim();
+    const still = $("newRoomStill")?.value?.trim();
+    if (!name) return log("Room name required");
+    if (!still) return log("Room still prompt required");
+    const id = $("newRoomId")?.value?.trim() || "";
+    const generate = !!$("newRoomGenerate")?.checked;
+    log(generate ? `Creating room + generating plate…` : `Creating room…`);
+    const res = await fetch("/api/scenes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, name, still, generate }),
+    });
+    const data = await res.json();
+    if (!data.ok) return log(`Create room failed: ${data.error}`);
+    log(`Saved room ${data.room.id}`);
+    $("newRoomName").value = "";
+    $("newRoomId").value = "";
+    $("newRoomStill").value = "";
+    setupLoaded = false;
+    await loadSetupLists();
+    if (data.job) {
+      renderRoomJob(data.job);
+      startRoomPoll(data.room.id);
+    }
   });
 
   $("setupScenesList")?.addEventListener("click", (ev) => {
@@ -1339,6 +2755,7 @@
     card.classList.toggle("is-on", on);
     card.classList.toggle("is-off", !on);
     card.setAttribute("aria-pressed", on ? "true" : "false");
+    state.setup = { ...(state.setup || {}), roomsLockedByUser: true };
     updateRoomsCount();
     scheduleSetupSave();
   });
@@ -1349,6 +2766,7 @@
       card.classList.remove("is-off");
       card.setAttribute("aria-pressed", "true");
     });
+    state.setup = { ...(state.setup || {}), roomsLockedByUser: true };
     updateRoomsCount();
     scheduleSetupSave();
   });
@@ -1359,6 +2777,7 @@
       card.classList.add("is-off");
       card.setAttribute("aria-pressed", "false");
     });
+    state.setup = { ...(state.setup || {}), roomsLockedByUser: true };
     updateRoomsCount();
     scheduleSetupSave();
   });
@@ -1542,7 +2961,11 @@
         await persistSetupDraft();
         // When await_setup appears, approve it once with this payload
         state._pendingSetupStart = payload;
-        const res = await fetch("/api/new-project", { method: "POST" });
+        const res = await fetch("/api/new-project", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
         const data = await res.json();
         if (!data.ok) {
           state._pendingSetupStart = null;
@@ -1672,12 +3095,36 @@
     try {
       const msg = JSON.parse(ev.data);
       if (msg.type === "log") log(msg.message);
-      else if (msg.type === "tabs") {
-        state.tabs = msg.tabs;
-        if (!state.running) {
-          // Keep progress markers in sync when disk tabs refresh
-          state.progress = msg.progress || state.progress;
+      else if (msg.type === "log-history") applyLogHistory(msg.lines);
+      else if (msg.type === "brief") {
+        if (msg.setup || msg.title) {
+          state.setup = { ...(state.setup || {}), ...(msg.setup || msg) };
+          applyBriefToForm(msg.setup || msg);
         }
+      } else if (msg.type === "character-job") {
+        if (msg.id && msg.id === studioId) {
+          renderStudioJob(msg);
+          if (!msg.running) {
+            studioSlideshowRemaking = false;
+            refreshStudioStatus();
+            if (msg.exitCode === 0) toast(`${msg.label || "Job"} finished`, "ok");
+            else if (msg.exitCode != null) {
+              const errText = msg.error || `exit ${msg.exitCode}`;
+              toast(`${msg.label || "Job"} failed: ${errText}`, "error");
+              const hint = $("datasetLightboxHint");
+              if (hint && !$("datasetLightbox")?.hidden) {
+                hint.textContent = errText;
+              }
+            }
+            syncLightboxUi();
+          } else {
+            setStudioBusy(true);
+            startStudioPoll();
+          }
+        }
+      } else if (msg.type === "tabs") {
+        state.tabs = msg.tabs;
+        if (msg.progress) state.progress = msg.progress;
         renderAll(msg.tabs);
       } else if (msg.type === "remake_done") {
         markRemade(msg);
@@ -1722,6 +3169,7 @@
   };
   es.onerror = () => log("SSE disconnected — retrying…");
 
+  restoreLogsFromSession();
   applyState(state);
   renderAll(state.tabs || {});
   refreshBatchPicker();

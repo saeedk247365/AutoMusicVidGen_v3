@@ -34,7 +34,7 @@
  *   --still-width N --still-height N --char-width N --char-height N
  */
 import { mkdir, writeFile, readFile, copyFile, unlink } from "fs/promises";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { join, dirname, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { spawn, execFile } from "child_process";
@@ -85,6 +85,8 @@ import {
   normalizeKidsLyricsText,
   shortenKidsLyricLines,
   repairTruncatedLyricLines,
+  ensureKidsLyricStructure,
+  dropJunkLyricLines,
   inferKidsHitThemeFromLyrics,
   repairKidsHitBeats,
   objectiveForTheme,
@@ -434,6 +436,7 @@ const CANONICAL_POSES = {
     "standing, one arm extended pointing forward toward sink or object, other arm at side, clear pointing pose",
   hands_up: "standing, both arms raised above head, elbows soft",
   clap: "standing, both hands pressed together mid-clap in front of chest, palms touching clearly, elbows out, happy clap pose",
+  wash: "standing at sink height, both hands under faucet rubbing palms together washing hands, fingers visible, soap suds gesture, clear preschool wash pose, no clap",
   stomp:
     "standing, one knee lifted mid-stomp, opposite foot planted, arms bent for balance",
   tiptoe:
@@ -469,9 +472,9 @@ const CANONICAL_FACINGS = {
 
 /** Other cast triggers to ban when generating a solo plate */
 const CAST_SOLO_NEGATIVES = {
-  adam: "Tom, tomchr, tomdad, Sasha, sashamom, adult, dad, mom, woman, father, mother, two people, multiple people, second person, couple, duo",
+  adam: "Tom, tomchr, tomdad, Sasha, sashamom, adult, dad, mom, woman, father, mother, girl, daughter, sister, twin, twins, duplicate child, second toddler, second boy, two toddlers, two children, three people, multiple people, second person, couple, duo, glasses, eyeglasses, spectacles",
   sasha:
-    "Tom, tomchr, Adam, adamboy, toddler, child, baby, boy, dad, father, man, masculine, two people, multiple people, second person, couple, duo",
+    "Tom, tomchr, Adam, adamboy, toddler, child, baby, boy, girl, daughter, twin, twins, dad, father, man, masculine, two people, multiple people, second person, couple, duo, second adult, glasses, eyeglasses",
 };
 
 function titleCaseName(c) {
@@ -487,6 +490,7 @@ function normalizePoseId(raw) {
     .replace(/[\s-]+/g, "_");
   if (CANONICAL_POSES[s]) return s;
   if (/tiptoe|tip.?toe|tip toe/.test(s)) return "tiptoe";
+  if (/wash|soap|scrub|rinse|suds/.test(s)) return "wash";
   if (/stomp|march|stamp/.test(s)) return "stomp";
   if (/kneel/.test(s)) return "kneel";
   if (/clap/.test(s)) return "clap";
@@ -778,7 +782,8 @@ function buildPlatePrompt(char, frame, beat) {
     isMom
       ? "adult woman proportions, taller than a toddler, clearly a mom"
       : "small toddler proportions",
-    "feet planted at bottom of frame",
+    "feet planted at bottom of frame ON THE FLOOR",
+    "standing on floorboards only, NEVER sitting on counter, NEVER standing on table or furniture",
     close ? "character fills mid-frame for hug staging" : "centered",
     "soft even studio lighting matching soft daylight",
     "clean contact silhouette",
@@ -787,7 +792,7 @@ function buildPlatePrompt(char, frame, beat) {
     CANONICAL_EXPRESSIONS[exprId],
     isMom ? "exactly one adult mom" : "exactly one toddler boy",
     "single character only",
-    "EMPTY FRAME except one character, no other people, no baby, no doll, no phantom child",
+    "EMPTY FRAME except one character, no other people, no baby, no doll, no phantom child, no twin, no clone",
     STUDIO_BG_PROMPT,
     "same exact outfit and identity",
   ]
@@ -808,12 +813,12 @@ function plateNegative(char) {
     "multiple people",
     "crowd",
     isMom
-      ? "toddler, child, baby, teen, sister, pink pants, white t-shirt, phantom child, doll in arms, second person, holding baby, holding toddler, child in arms"
-      : "adult, dad, mom, second person, twin",
+      ? "toddler, child, baby, teen, sister, daughter, pink pants, white t-shirt, phantom child, doll in arms, second person, holding baby, holding toddler, child in arms, twin, glasses"
+      : "adult, dad, mom, second person, twin, twins, duplicate child, second toddler, second boy, girl, daughter, glasses, eyeglasses, sitting on counter, standing on table",
     isMom ? "baby" : "mom",
     isMom
-      ? "teen, teenager, white t-shirt, white tee, pale t-shirt, mint shirt, green shirt, pink pants, pink trousers, salmon pants, cropped pants, handbag, purse, beanie, hat, short child, sister, young girl, athletic shirt, yoga pants, leggings with stripe, pink sneakers, spotlight, circular mat, blue floor, colored floor circle, floor spotlight"
-      : "hat, beanie, cap, different clothes, outfit change, spotlight, circular mat, blue floor",
+      ? "teen, teenager, white t-shirt, white tee, pale t-shirt, mint shirt, green shirt, pink pants, pink trousers, salmon pants, cropped pants, handbag, purse, beanie, hat, short child, sister, young girl, athletic shirt, yoga pants, leggings with stripe, pink sneakers, spotlight, circular mat, blue floor, colored floor circle, floor spotlight, glasses, eyeglasses"
+      : "hat, beanie, cap, different clothes, outfit change, spotlight, circular mat, blue floor, glasses, eyeglasses, twin, two children, sitting on counter, standing on table, climbing",
     "Tom",
     id === "adam" ? "Sasha" : "Adam",
     "dog",
@@ -1003,6 +1008,15 @@ function parseTitleAndLyrics(raw) {
     .trim();
 
   if (!title) title = `Nursery Song ${Date.now()}`;
+
+  // Plain LYRICS blocks (no [Intro]/[Chorus]) are common from small models —
+  // wrap them so the pipeline can continue instead of hard-failing.
+  if (lyrics && !/\[(Intro|Verse|Chorus)/i.test(lyrics)) {
+    lyrics = ensureKidsLyricStructure(lyrics, { objective, theme: title });
+  } else if (lyrics) {
+    lyrics = ensureKidsLyricStructure(lyrics, { objective, theme: title });
+  }
+
   if (!lyrics || !/\[(Intro|Verse|Chorus)/i.test(lyrics)) {
     throw new Error(`Could not parse lyrics:\n${text.slice(0, 400)}`);
   }
@@ -1015,6 +1029,9 @@ function normalizeLocation(raw, allowedLocations, beatIndex) {
     .toLowerCase()
     .trim()
     .replace(/\s+/g, "_");
+
+  // Prefer exact id when the user selected it (don't collapse backyard→lawn)
+  if (allowed.has(loc)) return loc;
 
   const aliases = {
     bathroom: "bedroom",
@@ -1051,38 +1068,196 @@ function normalizeLocation(raw, allowedLocations, beatIndex) {
   return fallback;
 }
 
+/** Resolve allowed room ids: --locations flag, else session, else all scenes. */
+function resolveAllowedLocationIds(scenePack, songDir = null) {
+  if (ALLOWED_LOCATION_IDS?.length) {
+    const filtered = (scenePack.scenes || [])
+      .map((s) => s.id)
+      .filter((id) => ALLOWED_LOCATION_IDS.includes(id));
+    if (filtered.length) return filtered;
+  }
+  if (songDir) {
+    try {
+      const sessionPath = join(songDir, "mvid-session.json");
+      if (existsSync(sessionPath)) {
+        const data = JSON.parse(stripBom(readFileSync(sessionPath, "utf8")));
+        const ids = Array.isArray(data.locationIds)
+          ? data.locationIds.map(String).filter(Boolean)
+          : [];
+        if (ids.length) {
+          const filtered = (scenePack.scenes || [])
+            .map((s) => s.id)
+            .filter((id) => ids.includes(id));
+          if (filtered.length) return filtered;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return (scenePack.scenes || []).map((s) => s.id);
+}
+
 function repairLooseJson(text) {
   let s = String(text || "");
   // Strip trailing commas before } or ]
   s = s.replace(/,\s*([}\]])/g, "$1");
+  // Remove trailing incomplete string literals at end of truncated JSON
+  s = s.replace(/,\s*"[^"]*$/g, "");
+  s = s.replace(/:\s*"[^"]*$/g, ': ""');
   // If truncated mid-array/object, close open brackets from the last complete beat
-  const lastBeat = s.lastIndexOf('},');
-  if (lastBeat > 0 && !/"beats"\s*:\s*\[[\s\S]*\]/.test(s)) {
-    // Find end of last complete object in beats array
-    let cut = s;
-    const beatsIdx = cut.indexOf('"beats"');
-    if (beatsIdx >= 0) {
-      const arrStart = cut.indexOf("[", beatsIdx);
-      if (arrStart >= 0) {
-        let depth = 0;
-        let lastComplete = -1;
-        for (let i = arrStart; i < cut.length; i++) {
-          const ch = cut[i];
-          if (ch === "{" || ch === "[") depth++;
-          else if (ch === "}" || ch === "]") {
-            depth--;
-            if (depth === 1 && ch === "}") lastComplete = i;
-            if (depth === 0) break;
-          }
+  const beatsIdx = s.indexOf('"beats"');
+  if (beatsIdx >= 0) {
+    const arrStart = s.indexOf("[", beatsIdx);
+    if (arrStart >= 0) {
+      let depth = 0;
+      let lastComplete = -1;
+      let inStr = false;
+      let esc = false;
+      for (let i = arrStart; i < s.length; i++) {
+        const ch = s[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (ch === "\\") esc = true;
+          else if (ch === '"') inStr = false;
+          continue;
         }
-        if (lastComplete > 0 && depth > 0) {
-          cut = cut.slice(0, lastComplete + 1) + "]}";
-          s = cut;
+        if (ch === '"') {
+          inStr = true;
+          continue;
         }
+        if (ch === "{" || ch === "[") depth++;
+        else if (ch === "}" || ch === "]") {
+          depth--;
+          if (depth === 1 && ch === "}") lastComplete = i;
+          if (depth === 0) break;
+        }
+      }
+      if (lastComplete > 0) {
+        // Keep only complete beat objects, then close beats[] and root {}
+        let cut = s.slice(0, lastComplete + 1);
+        // Ensure we close any open root keys after beats
+        const openRoot = (cut.match(/\{/g) || []).length - (cut.match(/\}/g) || []).length;
+        const openArr = (cut.match(/\[/g) || []).length - (cut.match(/\]/g) || []).length;
+        cut += "]".repeat(Math.max(0, openArr));
+        cut += "}".repeat(Math.max(0, openRoot));
+        s = cut.replace(/,\s*([}\]])/g, "$1");
       }
     }
   }
   return s;
+}
+
+/** Deterministic fallback when Ollama beat JSON keeps failing. */
+function fallbackKidsHitBeatPlan(ctx) {
+  const locs = (ctx.locations || []).filter(Boolean);
+  const story = locs.filter((id) => !/^(doorway|hallway)$/i.test(id));
+  const rooms = story.length ? story : ["kitchen", "kitchen_sink", "home"];
+  const lines = String(ctx.lyrics || "")
+    .split(/\n|[.!?]+/)
+    .map((l) => l.replace(/\[.*?\]/g, "").trim())
+    .filter((l) => l && !/^TITLE|^OBJECTIVE|^LYRICS/i.test(l));
+  const hints =
+    lines.length >= 8
+      ? lines.slice(0, 13)
+      : [
+          "dirty hands",
+          "can't eat yet",
+          "need to wash",
+          "soap and water",
+          "rub and splash",
+          "wash wash wash",
+          "squeaky clean",
+          "rinse and dry",
+          "towel time",
+          "wash wash wash",
+          "all done",
+          "ready to eat",
+          "yay neat",
+        ];
+  const arcs = [
+    "problem",
+    "problem",
+    "discovery",
+    "discovery",
+    "discovery",
+    "fun",
+    "fun",
+    "fun",
+    "fun",
+    "fun",
+    "celebration",
+    "celebration",
+    "celebration",
+  ];
+  const beats = hints.map((hint, i) => {
+    const arc = arcs[Math.min(i, arcs.length - 1)];
+    let loc = rooms[0];
+    if (arc === "discovery") loc = rooms[Math.min(1, rooms.length - 1)];
+    else if (arc === "fun") loc = rooms[Math.min(1, rooms.length - 1)];
+    else if (arc === "celebration") loc = rooms[rooms.length - 1];
+    // Wash hints snap to sink EXCEPT celebration (keep home) and problem (keep kitchen)
+    if (
+      arc !== "celebration" &&
+      arc !== "problem" &&
+      /wash|soap|splash|rinse|scrub|sink/i.test(hint) &&
+      rooms.includes("kitchen_sink") &&
+      i % 2 === 0
+    ) {
+      loc = "kitchen_sink";
+    }
+    if (i >= Math.floor(hints.length * 0.8) && rooms.length >= 2) {
+      loc = rooms[rooms.length - 1];
+    }
+    const washTheme = /wash|hands|kitchen/i.test(String(ctx.theme || ""));
+    const pose =
+      arc === "problem"
+        ? "stand"
+        : arc === "celebration"
+          ? "wave"
+          : washTheme
+            ? "wash"
+            : "clap";
+    const chars = [{ name: "Adam", pose, expression: "happy", facing: "front" }];
+    if (i % 2 === 1 || arc === "discovery" || arc === "celebration") {
+      chars.push({
+        name: "Sasha",
+        pose: washTheme ? "point" : "wave",
+        expression: "happy",
+        facing: "front",
+      });
+    }
+    return {
+      id: String(i + 1).padStart(2, "0"),
+      section:
+        arc === "problem"
+          ? "intro"
+          : arc === "discovery"
+            ? "verse_1"
+            : arc === "fun"
+              ? i < 8
+                ? "chorus"
+                : "verse_2"
+              : "outro",
+      storyBeat: arc,
+      location: loc,
+      lyricHint: hint.slice(0, 48),
+      cause: i === 0 ? "song starts" : `after ${hints[i - 1]}`.slice(0, 60),
+      effect: hint.slice(0, 60),
+      interaction: washTheme ? "wash hands at the sink" : "sing and move",
+      cutMotivation: "match_action",
+      actionPhase: arc === "fun" ? "peak" : "action",
+      cameraMotion: i % 3 === 0 ? "push_in" : i % 3 === 1 ? "track" : "pull_back",
+      emotionIntensity: arc === "fun" ? 4 : 3,
+      characters: chars,
+      placement: { Adam: "center" },
+    };
+  });
+  return {
+    theme: ctx.theme,
+    objective: ctx.objective || "",
+    beats,
+  };
 }
 
 function parseBeatsJson(raw, allowedLocations, opts = {}) {
@@ -1368,7 +1543,7 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
     if (ctx.locations) prompt += `Allowed places: ${ctx.locations}\n`;
   }
   const system = ctx.kidsHit
-    ? "You are a preschool hit songwriter. Follow the user format exactly. Output only TITLE and LYRICS. Keep the song short, concrete rhymes only, home-set. Never write nonsense end-words."
+    ? "You are a preschool hit songwriter. Output TITLE, OBJECTIVE, then LYRICS with [Intro] [Verse 1] [Chorus] [Verse 2] [Chorus] [Outro]. Write CHANTABLE singalong lines kids would shout — rhyme, hooks, repeated chorus. Do NOT narrate scenes/poses/camera (no 'Mom kneels', 'I look up'). Never truncate the last line."
     : "You are a world-class preschool songwriter. Follow the user format exactly. Output only TITLE and LYRICS.";
 
   let last = null;
@@ -1377,7 +1552,7 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
     try {
       const retryHint =
         ctx.kidsHit && attempt > 1
-          ? `\n\nRETRY ${attempt}: EVERY lyric line MUST be a COMPLETE thought of 6 words or fewer. Never end mid-phrase. Bad: "I'm stuck in my bed, can't". Good: "Stuck in bed now." "Blanket too tight." "Mom kneels by me."`
+          ? `\n\nRETRY ${attempt}: EVERY lyric line MUST be a COMPLETE thought of 6 words or fewer. Never end mid-phrase. MUST include section headers exactly:\n[Intro]\n...\n[Verse 1]\n...\n[Chorus]\n...\n[Verse 2]\n...\n[Chorus]\n...\n[Outro]\n...\nBad: "I'm stuck in my bed, can't". Good: "Stuck in bed now." "Blanket too tight." "Mom kneels by me."`
           : "";
       const content = await ollamaChat(
         model,
@@ -1387,16 +1562,33 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
         1800,
       );
       last = parseTitleAndLyrics(content);
-      last.lyrics = repairTruncatedLyricLines(
-        shortenKidsLyricLines(normalizeKidsLyricsText(last.lyrics), 6),
+      last.lyrics = ensureKidsLyricStructure(
+        repairTruncatedLyricLines(
+          shortenKidsLyricLines(normalizeKidsLyricsText(last.lyrics), 6),
+        ),
+        { objective: last.objective || ctx.lockedObjective || "", theme: ctx.theme || "" },
       );
       last.title = normalizeKidsLyricsText(last.title);
       if (!ctx.kidsHit) return last;
       const issues = lyricsHaveProblems(last.lyrics);
-      if (!issues.length) return last;
+      // Soft issues we can auto-fix / ignore on last attempts
+      const hard = issues.filter(
+        (i) =>
+          !/^(intro_missing_problem|outro_missing_celebration|single_room_lyrics)$/.test(
+            i,
+          ),
+      );
+      if (!hard.length) return last;
       console.warn(
         `  lyrics QA failed (attempt ${attempt}/${tries}): ${issues.join(", ")} — retrying`,
       );
+      if (attempt === tries) {
+        // Accept with soft issues rather than killing the whole project
+        console.warn(
+          `  lyrics QA soft-accept after ${tries} tries: ${issues.join(", ")}`,
+        );
+        return last;
+      }
     } catch (err) {
       console.warn(
         `  lyrics parse failed (attempt ${attempt}/${tries}): ${err.message?.slice(0, 120)} — retrying`,
@@ -1405,11 +1597,22 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
     }
   }
   if (ctx.kidsHit && last) {
-    last.lyrics = repairTruncatedLyricLines(last.lyrics);
-    const leftover = lyricsHaveProblems(last.lyrics);
+    last.lyrics = ensureKidsLyricStructure(
+      repairTruncatedLyricLines(last.lyrics),
+      { objective: last.objective || ctx.lockedObjective || "", theme: ctx.theme || "" },
+    );
+    const leftover = lyricsHaveProblems(last.lyrics).filter(
+      (i) =>
+        !/^(intro_missing_problem|outro_missing_celebration|single_room_lyrics)$/.test(
+          i,
+        ),
+    );
     if (leftover.length) {
-      throw new Error(`lyrics QA still failing after ${tries} tries: ${leftover.join(", ")}`);
+      console.warn(
+        `  lyrics QA leftover (continuing): ${leftover.join(", ")}`,
+      );
     }
+    return last;
   }
   return last;
 }
@@ -1472,13 +1675,26 @@ async function qwenGenerateBeats(model, temperature, ctx) {
         durationSec: ctx.durationSec,
         theme: ctx.theme,
         objective: ctx.objective || "",
+        lyricsText: ctx.lyrics || "",
       });
     } catch (err) {
       lastErr = err;
       console.warn(
         `  beat plan failed (attempt ${attempt}/${tries}): ${String(err.message || err).slice(0, 140)}`,
       );
-      if (attempt === tries) throw lastErr;
+      if (attempt === tries) {
+        if (ctx.kidsHit) {
+          console.warn("  using deterministic fallback beat plan (Ollama JSON failed)");
+          return normalizeBeatPlan(fallbackKidsHitBeatPlan(ctx), ctx.locations, {
+            kidsHit: true,
+            durationSec: ctx.durationSec,
+            theme: ctx.theme,
+            objective: ctx.objective || "",
+            lyricsText: ctx.lyrics || "",
+          });
+        }
+        throw lastErr;
+      }
     }
   }
   throw lastErr;
@@ -1726,7 +1942,8 @@ async function generateSongKeyframes(
     if (existsSync(src) && (!existsSync(dest) || force)) await copyFile(src, dest);
   }
 
-  const allowedLocations = (scenePack.scenes || []).map((s) => s.id);
+  const allowedLocations = resolveAllowedLocationIds(scenePack, songDir);
+  console.log(`  Allowed rooms: ${allowedLocations.join(", ")}`);
   let lyricsText = "";
   try {
     const lp = join(songDir, "lyrics.txt");
@@ -2050,7 +2267,9 @@ async function generateSongKeyframes(
     const canvasW = SETTINGS.stillWidth;
     const canvasH = SETTINGS.stillHeight;
     const beatCam = kidsHit
-      ? ensureCameraShotCard(beat, { index: k - 1 }).camera
+      ? beat.camera?.shotSize
+        ? beat.camera
+        : ensureCameraShotCard(beat, { index: k - 1 }).camera
       : null;
 
     // Shared oversize plate lock (virtual set for pan/zoom)
@@ -2293,7 +2512,7 @@ async function main() {
       session.style ||
       (kidsHit ? kidsHitStyleForMood(kidsHitMood(theme), KIDS_HIT_STYLES) : pick(STYLES));
     const slug = session.slug || songDir.split(/[/\\]/).pop();
-    const locations = scenePack.scenes.map((s) => s.id);
+    const locations = resolveAllowedLocationIds(scenePack, songDir);
     const bpmLocal = Number(flag("--bpm", String(session.bpm || SETTINGS.bpm)));
     const stepsLocal = Number(flag("--steps", String(session.steps || SETTINGS.steps)));
     const durationLocal = has("--duration")
@@ -2453,7 +2672,7 @@ async function main() {
     if (!existsSync(songDir)) throw new Error(`Song folder not found: ${songDir}`);
     const actionsPath = join(songDir, "scenes", "actions.json");
     const lyricsPath = join(songDir, "lyrics.txt");
-    const locations = scenePack.scenes.map((s) => s.id);
+    const locations = resolveAllowedLocationIds(scenePack, songDir);
     let plan;
 
     if (has("--replan")) {

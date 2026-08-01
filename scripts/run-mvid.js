@@ -141,7 +141,19 @@ async function main() {
   await orchestrator.hydrateSetupFromDisk();
 
   const { listen } = createMvidServer(orchestrator, { port });
-  const { url } = await listen();
+  let server;
+  let url;
+  try {
+    ({ server, url } = await listen());
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (/EADDRINUSE/i.test(msg)) {
+      throw new Error(
+        `Port ${port} is already in use. Stop the other mvid (or kill the node process on that port), then run again.`,
+      );
+    }
+    throw err;
+  }
 
   if (forceNew) {
     console.log("Starting new project (--new)");
@@ -188,6 +200,20 @@ async function main() {
 
   console.log(`GUI listening at ${url} (Ctrl+C to stop)`);
   console.log(`Project root: ${ROOT}`);
+
+  // Keep the process alive until Ctrl+C (some Windows shells drop the listen handle).
+  await new Promise((resolve) => {
+    const shutdown = () => {
+      try {
+        server?.close();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  });
 }
 
 main().catch((err) => {

@@ -6,7 +6,13 @@ import { exec, execFile } from "child_process";
 import { promisify } from "util";
 import { platform } from "os";
 import { randomUUID, randomInt } from "crypto";
+import sharp from "sharp";
 import { buildOpenPosePng, ANGLE_YAW } from "../lib/openpose-maps.js";
+import {
+  toChromaTrainingPlate,
+  checkChromaBorder,
+  checkOutfitPalette,
+} from "../lib/chroma-plate.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,11 +43,12 @@ const execFileAsync = promisify(execFile);
  *   Closest keyframe (yaw, pose, expression, bust) ? img2img + OpenPose.
  *   Identity from latent. OpenPose controls pose only.
  *
- * Adaptive denoise: easy ~0.55 | medium ~0.72 | hard ~0.82
+ * Adaptive denoise: easy ~0.50 | medium ~0.62 | hard ~0.82
  * Rebuilds (sit, crawl, rear, front→strict profile): EmptyLatent + denoise=1 + FaceID.
  * FaceID also on img2img when denoise >= 0.65 (not at ~0.55).
  * Keyframe refresh is OPT-IN (--keyframe-refresh). Default: master authority stays fixed.
- * Identity gate: InsightFace similarity vs master after each keyframe/shot (skip if no face).
+ * Identity gate: chroma BG + outfit palette + InsightFace (hard-fail; no silent keep-best).
+ * Yaw ladder: front → ±30 → ±45 → profile (≤30° hops, low denoise).
  */
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -86,6 +93,11 @@ const IDENTITY_THRESHOLD = Number(flag("--identity-threshold", "0.40"));
 const IDENTITY_RETRIES = Math.max(1, Number(flag("--identity-retries", "3")));
 /** Legacy: invent face_lock from EmptyLatent+text. Causes identity drift ? avoid. */
 const BOOTSTRAP_FROM_TEXT = has("--bootstrap-from-text");
+const NO_OPEN = has("--no-open");
+const MASTER_CANDIDATES = Math.max(
+  1,
+  Math.min(10, Number(flag("--master-candidates", "1")) || 1),
+);
 const REF_FLAG = flag("--ref", null);
 const COMFY_ROOT =
   flag("--comfy-root", null) || join(ROOT, "ComfyUI");
@@ -116,10 +128,12 @@ const LORA_NAME = flag("--lora", null);
 const LORA_STRENGTH = Number(flag("--lora-strength", "0.9"));
 const IDENTITY_BACKEND = flag("--identity", "faceid"); // faceid | none
 
-/** Canonical viewpoint bank ? bootstrap via img2img from master; may refresh later. */
+/** Canonical viewpoint bank — yaw ladder before hard angles. */
 const KEYFRAME_SPECS_BASE = [
   { id: "front", angleKey: "front", poseKey: "stand", expression: "neutral", caption: "front stand neutral" },
+  { id: "left30", angleKey: "threequarter_soft_left", poseKey: "stand", expression: "neutral", caption: "soft three-quarter left" },
   { id: "left45", angleKey: "threequarter_left", poseKey: "stand", expression: "neutral", caption: "three-quarter left" },
+  { id: "right30", angleKey: "threequarter_soft_right", poseKey: "stand", expression: "neutral", caption: "soft three-quarter right" },
   { id: "right45", angleKey: "threequarter_right", poseKey: "stand", expression: "neutral", caption: "three-quarter right" },
   { id: "left_profile", angleKey: "side_left", poseKey: "stand", expression: "neutral", caption: "left profile" },
   { id: "right_profile", angleKey: "side_right", poseKey: "stand", expression: "neutral", caption: "right profile" },
@@ -169,6 +183,11 @@ function openFile(path) {
         ? `open "${path}"`
         : `xdg-open "${path}"`;
   exec(cmd);
+}
+
+function shouldOpenImages(cfg) {
+  if (NO_OPEN) return false;
+  return cfg.openImages === true;
 }
 
 function sleep(ms) {
@@ -292,11 +311,6 @@ function expressionPrompt(shot, cfg = {}) {
   }
 }
 
-function isToddler(cfg) {
-  const blob = `${cfg.role || ""} ${cfg.age || ""} ${cfg.trigger || ""} ${cfg.styleTag || ""} ${cfg.appearance || ""}`;
-  return /toddler|baby|adamboy|bibibaby/i.test(blob);
-}
-
 function isStrictProfile(angleKey) {
   return angleKey === "side_left" || angleKey === "side_right";
 }
@@ -336,27 +350,38 @@ function poseEditDifficulty(shot, source) {
 }
 
 /**
- * Adaptive denoise (img2img only ? rebuilds use denoise=1):
- *   easy ~0.55 | medium ~0.72 | hard ~0.82 | extreme ~0.88?0.95
+ * Adaptive denoise (img2img only — rebuilds use denoise=1):
+ *   yaw-ladder hop ≤30° ~0.50 | medium ~0.62 | hard ~0.82 | extreme ~0.88–0.95
  * Walk/sit get a floor bump so old legs are replaced (reduces ghost/double legs).
  */
 function denoiseForEdit(shot, source, base = BASE_DENOISE) {
   const difficulty = poseEditDifficulty(shot, source);
   const dstPose = effectivePoseKey(shot);
+  const yawDelta = angularDistance(source.yaw ?? 0, yawOf(shot.angleKey));
+  const samePose =
+    (source.poseKey || "stand") === dstPose &&
+    expressionOf(shot) === (source.expression || "neutral") &&
+    Boolean(shot.bust) === Boolean(source.bust);
+
   let d;
   if (difficulty >= 4) d = clamp(Math.max(base, 0.9), 0.88, 0.95);
   else if (difficulty >= 3) d = clamp(Math.max(base, 0.82), 0.78, 0.88);
-  else if (difficulty >= 2) d = clamp(Math.max(base, 0.72), 0.68, 0.8);
-  else if (difficulty >= 1) d = clamp(Math.max(base, 0.62), 0.55, 0.72);
-  else d = clamp(base, 0.5, 0.58);
+  else if (difficulty >= 2) d = clamp(Math.max(base, 0.62), 0.58, 0.7);
+  else if (difficulty >= 1) d = clamp(Math.max(base * 0.95, 0.5), 0.45, 0.55);
+  else d = clamp(base, 0.45, 0.52);
 
-  // Limb / gesture edits: enough denoise to change pose, FaceID anchors identity at >=0.65
-  if (dstPose === "walk") d = clamp(Math.max(d, 0.72), 0.72, 0.78);
+  // Pure yaw ladder hop: keep identity by staying low
+  if (samePose && yawDelta > 0 && yawDelta <= 35) {
+    d = clamp(Math.min(d, 0.52), 0.45, 0.55);
+  }
+
+  // Limb / gesture edits: enough denoise to change pose, FaceID/IPAdapter anchors identity
+  if (dstPose === "walk") d = clamp(Math.max(d, 0.68), 0.68, 0.75);
   if (dstPose === "sit" || dstPose === "crawl") d = Math.max(d, 0.82);
   if (dstPose === "wave" || dstPose === "point" || dstPose === "hands_up") {
-    d = clamp(Math.max(d, 0.7), 0.7, 0.75);
+    d = clamp(Math.max(d, 0.65), 0.65, 0.72);
   }
-  return clamp(d, 0.5, 0.95);
+  return clamp(d, 0.45, 0.95);
 }
 
 /**
@@ -493,7 +518,32 @@ function readMasterSeedRecord() {
 
 async function writeMasterApproval({ source = "manual", note = "" } = {}) {
   if (!existsSync(MASTER_PATH)) {
-    throw new Error(`Cannot approve ? missing master: ${MASTER_PATH}`);
+    throw new Error(`Cannot approve — missing master: ${MASTER_PATH}`);
+  }
+  const cfgW = 512;
+  const cfgH = 768;
+  try {
+    const rawCfg = JSON.parse(
+      (await readFile(CONFIG_PATH, "utf8")).replace(/^\uFEFF/, ""),
+    );
+    // use character canvas size when available
+    const w = Number(rawCfg.width) || cfgW;
+    const h = Number(rawCfg.height) || cfgH;
+    const plate = await toChromaTrainingPlate(await readFile(MASTER_PATH), {
+      width: w,
+      height: h,
+    });
+    await writeFile(MASTER_PATH, plate.buffer);
+    await writeFile(FACE_LOCK, plate.buffer);
+    await mkdir(KEYFRAMES_DIR, { recursive: true });
+    await copyFile(MASTER_PATH, join(KEYFRAMES_DIR, "front.png"));
+    console.log(
+      plate.rembg
+        ? "  master → rembg + chroma plate (face_lock + front synced)"
+        : `  master → chroma fallback (${plate.error || "rembg unavailable"})`,
+    );
+  } catch (err) {
+    console.log(`  warn: chroma normalize on approve failed: ${err.message || err}`);
   }
   const seedRec = readMasterSeedRecord();
   const stamp = {
@@ -502,10 +552,11 @@ async function writeMasterApproval({ source = "manual", note = "" } = {}) {
     character: CONFIG_PATH,
     source,
     masterSeed: seedRec?.seed ?? null,
+    chromaPlate: true,
     note: note || undefined,
   };
   await writeFile(MASTER_APPROVED_PATH, JSON.stringify(stamp, null, 2), "utf8");
-  console.log(`  ? master APPROVED ? ${MASTER_APPROVED_PATH}`);
+  console.log(`  ✓ master APPROVED → ${MASTER_APPROVED_PATH}`);
   if (stamp.masterSeed != null) {
     console.log(`  locked invent seed=${stamp.masterSeed} (keyframes/shots still use character seed)`);
   }
@@ -553,10 +604,14 @@ function shotAngleText(shot) {
   if (shot.angle) return shot.angle;
   const map = {
     front: "front view, body facing camera, looking at camera",
+    threequarter_soft_left:
+      "soft three-quarter view from the left, body turned ~30 degrees left, head and torso facing the same left direction, natural neck, NOT twisted toward camera",
     threequarter_left:
-      "three-quarter view from the left, body turned ~40 degrees left, head and torso facing the same left direction, natural neck, NOT twisted toward camera",
+      "three-quarter view from the left, body turned ~55 degrees left, head and torso facing the same left direction, natural neck, NOT twisted toward camera",
+    threequarter_soft_right:
+      "soft three-quarter view from the right, body turned ~30 degrees right, head and torso facing the same right direction, natural neck, NOT twisted toward camera",
     threequarter_right:
-      "three-quarter view from the right, body turned ~40 degrees right, head and torso facing the same right direction, natural neck, NOT twisted toward camera",
+      "three-quarter view from the right, body turned ~55 degrees right, head and torso facing the same right direction, natural neck, NOT twisted toward camera",
     side_left:
       "strict left profile side view, 90 degrees, head and body both facing left, only one eye and one ear visible, nose pointing left, natural neck alignment, NOT looking at camera",
     side_right:
@@ -580,9 +635,17 @@ function normalizeShot(shot) {
   };
 }
 
-/** Shared render style ? centralized here; character JSON should use styleTag only. */
-const STYLE_LOCK =
-  "flat 2D anime cartoon illustration, clean cel shading, simple bold lineart, soft even studio lighting, consistent cartoon style";
+/** Shared render style — overridden by cfg.styleFamily when set. */
+const STYLE_LOCK_BY_FAMILY = {
+  flat2d:
+    "flat 2D anime cartoon illustration, clean cel shading, simple bold lineart, soft even studio lighting, consistent cartoon style",
+  kids3d:
+    "kids 3D CGI cartoon style, soft rounded shapes, clean animation lighting, consistent character design, not photoreal",
+  anime:
+    "anime cartoon illustration, clean lineart, soft cel shading, consistent anime character design",
+};
+
+const STYLE_LOCK = STYLE_LOCK_BY_FAMILY.flat2d;
 
 /** Chroma-key green — captioned so LoRA can drop it at inference; never train scenic rooms. */
 const BG_CHROMA =
@@ -591,40 +654,100 @@ const BG_CHROMA =
 const BG_CHROMA_CAPTION = "plain solid chroma key green background";
 
 const BG_CHROMA_NEGATIVE =
-  "gray background, white background, beige background, room interior, furniture, kitchen, bedroom, lawn, scenery, gradient background, textured wall, circle backdrop";
-
-/** @deprecated alias — kept so older call sites still resolve */
-const BG_GRAY = BG_CHROMA;
+  "gray background, white background, beige background, room interior, furniture, kitchen, bedroom, lawn, scenery, gradient background, textured wall, circle backdrop, nursery, bookshelf, toys, plants, cardboard boxes";
 
 /** Short clothing tokens — SD attention prefers brevity over long rule essays. */
 const OUTFIT_LOCK =
-  "mint green crew neck t-shirt, navy toddler pants, white sneakers, same outfit every image";
+  "solid sky blue crew neck t-shirt, navy toddler pants, white sneakers, same outfit every image";
 
 const OUTFIT_NEGATIVE =
-  "shorts, bare legs, bare feet, jeans, logo, stripes, different clothes, clothing change, colored sneakers";
+  "shorts, bare legs, bare feet, jeans, logo, stripes, layered sleeves, different clothes, clothing change, colored sneakers, tote bag, backpack, jacket change";
 
 const STYLE_NEGATIVE =
-  "photo, photorealistic, realistic skin texture, detailed pores, hyperrealistic, cinematic lighting, dramatic lighting, volumetric lighting, 3d render, octane, unreal engine";
+  "photo, photorealistic, realistic skin texture, detailed pores, hyperrealistic, cinematic lighting, dramatic lighting, volumetric lighting, octane, unreal engine";
 
 const ANATOMY_NEGATIVE =
   "twisted neck, broken neck, impossible neck, head spun around, looking over shoulder, head facing camera while body turned away, extra legs, ghost legs, double legs, fused legs, overlapping legs, extra feet, three legs, malformed legs, extra limbs, duplicate limbs";
 
-const TODDLER_LOCK =
-  "toddler proportions, slightly large head relative to body, short legs, small hands, small feet, consistent head-to-body ratio, not overweight";
+const AGE_LOCKS = {
+  toddler:
+    "toddler proportions, slightly large head relative to body, short legs, small hands, small feet, consistent head-to-body ratio, not overweight",
+  child:
+    "young child proportions, slightly large head, short limbs, kid body, not toddler, not teen, not adult",
+  teen: "teenage proportions, youthful face, longer limbs than child, not adult, not toddler",
+  adult: "adult proportions, adult head-to-body ratio, adult limbs, not child, not toddler",
+};
 
-const TODDLER_NEGATIVE =
-  "adult proportions, long legs, tall child, teen body, small head large body, fat, obese, overweight, chubby, pudgy, bloated belly, double chin";
+const AGE_NEGATIVES = {
+  toddler:
+    "adult proportions, long legs, tall child, teen body, small head large body, fat, obese, overweight, chubby, pudgy, bloated belly, double chin",
+  child: "toddler baby proportions, adult body, teen facial hair, elderly",
+  teen: "toddler, baby, elderly wrinkles, middle-aged",
+  adult: "toddler, baby, child proportions, oversized toddler head",
+};
 
-const BOY_LOCK =
-  "male toddler boy only, masculine little boy, boy haircut, boy face";
+const GENDER_LOCKS = {
+  boy: "male child boy only, masculine boy face, boy haircut",
+  girl: "female child girl only, feminine girl face, girl hair",
+  man: "adult man only, masculine adult male face",
+  woman: "adult woman only, feminine adult female face",
+};
 
-const BOY_NEGATIVE =
-  "girl, female, woman, feminine, androgynous, female toddler, female child, long hair, pigtails, hair bow, dress, skirt, pink outfit, makeup, lipstick, heavy eyelashes";
+const GENDER_NEGATIVES = {
+  boy: "girl, female, woman, feminine, androgynous, female toddler, female child, long hair, pigtails, hair bow, dress, skirt, pink outfit, makeup, lipstick",
+  girl: "boy, male, man, masculine, beard, short boy haircut only",
+  man: "woman, female, child, toddler, feminine",
+  woman: "man, male, beard, child, toddler, masculine",
+};
+
+const TODDLER_LOCK = AGE_LOCKS.toddler;
+const TODDLER_NEGATIVE = AGE_NEGATIVES.toddler;
+const BOY_LOCK = GENDER_LOCKS.boy;
+const BOY_NEGATIVE = GENDER_NEGATIVES.boy;
+
+function resolveGender(cfg) {
+  const g = String(cfg.gender || "").toLowerCase().trim();
+  if (GENDER_LOCKS[g]) return g;
+  const blob = `${cfg.trigger || ""} ${cfg.age || ""} ${cfg.role || ""} ${cfg.appearance || ""} ${cfg.styleTag || ""}`;
+  if (/\bgirl\b|female|woman|mom|mother/i.test(blob)) {
+    return /adult|mom|mother|woman/i.test(blob) ? "woman" : "girl";
+  }
+  if (/\bwoman\b|\bmom\b|mother/i.test(blob)) return "woman";
+  if (/\bman\b|father|dad|adult man/i.test(blob)) return "man";
+  return "boy";
+}
+
+function resolveAgeBand(cfg) {
+  const a = String(cfg.ageBand || "").toLowerCase().trim();
+  if (AGE_LOCKS[a]) return a;
+  const blob = `${cfg.role || ""} ${cfg.age || ""} ${cfg.trigger || ""} ${cfg.styleTag || ""} ${cfg.appearance || ""}`;
+  if (/toddler|baby|infant|2 year/i.test(blob)) return "toddler";
+  if (/teen|adolescent|15 year/i.test(blob)) return "teen";
+  if (/adult|mother|father|mom|dad|30 year|32 year/i.test(blob)) return "adult";
+  if (/child|5 year|10 year|preschool|preteen/i.test(blob)) return "child";
+  return "toddler";
+}
+
+function resolveStyleFamily(cfg) {
+  const s = String(cfg.styleFamily || "").toLowerCase().trim();
+  if (STYLE_LOCK_BY_FAMILY[s]) return s;
+  const blob = `${cfg.styleTag || ""} ${cfg.style || ""} ${cfg.checkpoint || ""}`;
+  if (/anime|cel|flat 2d|flat2d/i.test(blob)) return "flat2d";
+  if (/3d|cgi|cocomelon|pixar/i.test(blob)) return "kids3d";
+  return "flat2d";
+}
 
 function isBoy(cfg) {
-  const blob = `${cfg.trigger || ""} ${cfg.age || ""} ${cfg.role || ""} ${cfg.appearance || ""} ${cfg.styleTag || ""}`;
-  return /\bboy\b|male|adamboy|tomchr/i.test(blob);
+  const g = resolveGender(cfg);
+  return g === "boy" || g === "man";
 }
+
+function isToddler(cfg) {
+  return resolveAgeBand(cfg) === "toddler";
+}
+
+/** @deprecated alias — kept so older call sites still resolve */
+const BG_GRAY = BG_CHROMA;
 
 /** Solid chroma-green identity plates only — scenes belong in animation compositing, not LoRA training. */
 function backgroundForShot(shot) {
@@ -632,24 +755,49 @@ function backgroundForShot(shot) {
   return BG_CHROMA;
 }
 
-function outfitPositive(cfg) {
+function outfitPositive(cfg, shot = null) {
+  const shotOutfit = String(shot?.outfit || "").trim();
+  if (shotOutfit) return shotOutfit;
   // Prefer short global lock; character outfit only if it is already short
   const o = (cfg.outfit || "").trim();
   if (o && o.length <= 120) return o;
   return OUTFIT_LOCK;
 }
 
+function appearancePositive(cfg, shot = null) {
+  const shotAppearance = String(shot?.appearance || "").trim();
+  if (shotAppearance) return shotAppearance;
+  return cfg.appearance || "";
+}
+
+function identityLockParts(cfg) {
+  const gender = resolveGender(cfg);
+  const ageBand = resolveAgeBand(cfg);
+  const styleFamily = resolveStyleFamily(cfg);
+  return {
+    gender,
+    ageBand,
+    styleFamily,
+    genderLock: GENDER_LOCKS[gender],
+    genderNegative: GENDER_NEGATIVES[gender],
+    ageLock: AGE_LOCKS[ageBand],
+    ageNegative: AGE_NEGATIVES[ageBand],
+    styleLock: STYLE_LOCK_BY_FAMILY[styleFamily] || STYLE_LOCK,
+  };
+}
+
 function styleParts(cfg, { rebuild = false } = {}) {
-  const parts = [STYLE_LOCK];
+  const locks = identityLockParts(cfg);
+  const parts = [locks.styleLock];
   if (cfg.styleTag) parts.push(cfg.styleTag);
   else if (cfg.style && !/flat 2D anime cartoon illustration/i.test(cfg.style)) {
     parts.push(cfg.style);
   }
-  if (isToddler(cfg)) parts.push(TODDLER_LOCK);
-  if (isBoy(cfg)) parts.push(BOY_LOCK);
+  parts.push(locks.ageLock);
+  parts.push(locks.genderLock);
   if (rebuild) {
     parts.push(
-      "strict flat cel-shaded cartoon only, same illustration style as the master identity, not realistic",
+      "strict consistent cartoon style only, same illustration style as the master identity, not realistic",
     );
   }
   return parts;
@@ -690,12 +838,13 @@ function characterPrompt(cfg, shot, { rebuild = false } = {}) {
   const expr = expressionPrompt(shot, cfg);
   const bg = backgroundForShot(shot);
   const style = styleParts(cfg, { rebuild }).join(", ");
-  const outfit = outfitPositive(cfg);
+  const outfit = outfitPositive(cfg, shot);
+  const appearance = appearancePositive(cfg, shot);
 
   if (shot.bust) {
     return [
       cfg.trigger,
-      cfg.appearance,
+      appearance,
       outfit,
       shot.angle,
       shot.pose,
@@ -711,7 +860,7 @@ function characterPrompt(cfg, shot, { rebuild = false } = {}) {
   }
   return [
     cfg.trigger,
-    cfg.appearance,
+    appearance,
     outfit,
     shot.angle,
     shot.pose,
@@ -729,14 +878,15 @@ function characterPrompt(cfg, shot, { rebuild = false } = {}) {
 }
 
 function shotNegative(cfg, shot) {
+  const locks = identityLockParts(cfg);
   return [
-    cfg.negative,
+    String(shot?.negative || "").trim() || cfg.negative,
     OUTFIT_NEGATIVE,
     STYLE_NEGATIVE,
     ANATOMY_NEGATIVE,
     BG_CHROMA_NEGATIVE,
-    isToddler(cfg) ? TODDLER_NEGATIVE : null,
-    isBoy(cfg) ? BOY_NEGATIVE : null,
+    locks.ageNegative,
+    locks.genderNegative,
     shot.extraNegative,
   ]
     .filter(Boolean)
@@ -744,7 +894,7 @@ function shotNegative(cfg, shot) {
 }
 
 function captionFor(cfg, shot) {
-  return `${cfg.trigger}, ${shot.captionExtra || shot.caption || ""}, ${cfg.appearance}, ${outfitPositive(cfg)}, ${BG_CHROMA_CAPTION}`
+  return `${cfg.trigger}, ${shot.captionExtra || shot.caption || ""}, ${appearancePositive(cfg, shot)}, ${outfitPositive(cfg, shot)}, ${BG_CHROMA_CAPTION}`
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -794,6 +944,30 @@ const IdentityBackends = {
         },
       };
       wf._modelRef = ["24", 0];
+    },
+    /** Cartoon-safe identity: IP-Adapter image ref (no InsightFace). */
+    attachMasterIpAdapter(wf, { refImageName, weight = 0.55 }) {
+      wf["30"] = { class_type: "LoadImage", inputs: { image: refImageName } };
+      wf["31"] = {
+        class_type: "IPAdapterUnifiedLoader",
+        inputs: {
+          model: wf._modelRef,
+          preset: "PLUS (high strength)",
+        },
+      };
+      wf["32"] = {
+        class_type: "IPAdapter",
+        inputs: {
+          model: ["31", 0],
+          ipadapter: ["31", 1],
+          image: ["30", 0],
+          weight,
+          weight_type: "standard",
+          start_at: 0,
+          end_at: 0.85,
+        },
+      };
+      wf._modelRef = ["32", 0];
     },
   },
 };
@@ -1000,6 +1174,8 @@ function img2imgOpenPoseWorkflow(cfg, opts) {
     backend,
     faceImageName,
     useFaceId = false,
+    useIpAdapter = false,
+    ipAdapterImageName = null,
     fromEmptyLatent = false,
   } = opts;
 
@@ -1011,6 +1187,16 @@ function img2imgOpenPoseWorkflow(cfg, opts) {
       faceImageName,
       weight: w,
       weightV2: w,
+    });
+  } else if (
+    useIpAdapter &&
+    backend.attachMasterIpAdapter &&
+    (ipAdapterImageName || faceImageName)
+  ) {
+    const w = denoise >= 0.72 ? 0.65 : denoise >= 0.55 ? 0.55 : 0.45;
+    backend.attachMasterIpAdapter(wf, {
+      refImageName: ipAdapterImageName || faceImageName,
+      weight: w,
     });
   }
 
@@ -1109,8 +1295,14 @@ function scoreKeyframe(shot, kf) {
   const wantSmile = expressionOf(shot) === "smile";
   const wantBust = Boolean(shot.bust);
   const wantPose = effectivePoseKey(shot);
+  const srcAngle = kf.angleKey || "front";
+  const dstAngle = shot.angleKey || "front";
 
   let score = angularDistance(targetYaw, kf.yaw);
+
+  // Prefer staying on the same side of the yaw ladder — never jump via strict profile/rear.
+  if (isStrictProfile(dstAngle) !== isStrictProfile(srcAngle)) score += 80;
+  if (isRearView(dstAngle) !== isRearView(srcAngle)) score += 70;
 
   if (wantSmile && kf.expression === "smile") score -= 20;
   if (!wantSmile && kf.expression === "neutral") score -= 4;
@@ -1123,6 +1315,7 @@ function scoreKeyframe(shot, kf) {
   if (wantPose === "stand" && (kf.poseKey || "stand") === "stand") score -= 3;
   if (wantPose === "bust" && kf.bust) score -= 10;
   if (kf.angleKey === shot.angleKey) score -= 15;
+  if (kf.id === "front" && !wantBust && wantPose === "stand") score -= 2;
 
   return score;
 }
@@ -1229,11 +1422,11 @@ async function checkIdentitySimilarity(candidatePath) {
       ? MASTER_PATH
       : null;
   if (!ref) {
-    return { skipped: true, pass: true, similarity: null, reason: "no_ref" };
+    return { skipped: true, pass: false, similarity: null, reason: "no_ref" };
   }
   if (!existsSync(COMFY_PYTHON) || !existsSync(IDENTITY_SCRIPT)) {
     console.log("  identity_gate=skipped (Comfy python or helper missing)");
-    return { skipped: true, pass: true, similarity: null, reason: "helper_missing" };
+    return { skipped: true, pass: false, similarity: null, reason: "helper_missing" };
   }
   try {
     const { stdout } = await execFileAsync(
@@ -1251,14 +1444,14 @@ async function checkIdentitySimilarity(candidatePath) {
       if (data.reason === "no_face") {
         return {
           skipped: true,
-          pass: true,
+          pass: false,
           similarity: null,
-          reason: "skipped_no_face",
+          reason: "no_face",
         };
       }
       return {
         skipped: true,
-        pass: true,
+        pass: false,
         similarity: null,
         reason: data.reason || "gate_error",
       };
@@ -1267,9 +1460,47 @@ async function checkIdentitySimilarity(candidatePath) {
     const pass = sim >= IDENTITY_THRESHOLD;
     return { skipped: false, pass, similarity: sim, reason: pass ? "ok" : "below_threshold" };
   } catch (err) {
-    console.log(`  identity_gate=skipped (error: ${err.message || err})`);
-    return { skipped: true, pass: true, similarity: null, reason: "exec_error" };
+    console.log(`  identity_gate=error (${err.message || err})`);
+    return { skipped: true, pass: false, similarity: null, reason: "exec_error" };
   }
+}
+
+/**
+ * Multi-signal plate gate: chroma BG + outfit palette + face (when available).
+ * no_face does NOT auto-pass — palette+chroma must still pass.
+ */
+async function checkPlateGates(candidatePath) {
+  if (SKIP_IDENTITY_GATE) {
+    return { pass: true, reason: "skipped", reasons: [], face: null, chroma: null, palette: null };
+  }
+  const reasons = [];
+  const chroma = await checkChromaBorder(candidatePath);
+  if (!chroma.pass) reasons.push(chroma.reason || "bg_not_chroma");
+
+  const masterRef = existsSync(MASTER_PATH) ? MASTER_PATH : FACE_LOCK;
+  let palette = null;
+  if (existsSync(masterRef)) {
+    palette = await checkOutfitPalette(candidatePath, masterRef);
+    if (!palette.pass) reasons.push(palette.reason || "outfit_drift");
+  } else {
+    reasons.push("no_master_ref");
+  }
+
+  const face = await checkIdentitySimilarity(candidatePath);
+  if (!face.skipped && !face.pass) reasons.push(face.reason || "identity_reject");
+  // Face detected and passed: good. no_face / helper missing: rely on chroma+palette only.
+  if (face.skipped && face.reason === "no_ref") reasons.push("no_face_ref");
+
+  const pass = reasons.length === 0;
+  return {
+    pass,
+    reason: pass ? "ok" : reasons[0],
+    reasons,
+    face,
+    chroma,
+    palette,
+    similarity: face?.similarity ?? null,
+  };
 }
 
 /** True if InsightFace can detect a face on path (same image vs itself). */
@@ -1299,7 +1530,6 @@ async function runEdit(cfg, ctx) {
   const {
     shot,
     source,
-    denoise,
     seed,
     prefix,
     outPath,
@@ -1307,9 +1537,19 @@ async function runEdit(cfg, ctx) {
     loraName,
     backend,
     faceUploadName,
+    ipAdapterUploadName = null,
     fromEmptyLatent,
     useFaceId,
+    useIpAdapter = false,
   } = ctx;
+  let denoise = ctx.denoise;
+
+  if (denoise >= 0.65 && !useFaceId && !useIpAdapter) {
+    console.log(
+      `  warn: denoise ${denoise.toFixed(2)} without FaceID/IP-Adapter — clamping to 0.55 for ${prefix}`,
+    );
+    denoise = 0.55;
+  }
 
   const { poseName } = await uploadPose(cfg, shot, prefix);
   const prompt = characterPrompt(cfg, shot, { rebuild: fromEmptyLatent });
@@ -1317,66 +1557,132 @@ async function runEdit(cfg, ctx) {
 
   const attempts = SKIP_IDENTITY_GATE ? 1 : IDENTITY_RETRIES;
   let best = null;
-  let bestSim = -Infinity;
+  let bestScore = -Infinity;
   let lastGate = null;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     const attemptSeed = (seed + attempt * 9973) >>> 0;
-    const buf = await queueAndWait(
-      cfg.comfyUrl,
-      img2imgOpenPoseWorkflow(cfg, {
-        loraName,
-        sourceImageName: source?.uploadName,
-        poseMapName: poseName,
-        prompt,
-        negative,
-        seed: attemptSeed,
-        denoise,
-        openPoseStrength: OPENPOSE_STRENGTH,
-        prefix: `id_${prefix}`,
-        backend,
-        faceImageName: faceUploadName,
-        useFaceId,
-        fromEmptyLatent,
-      }),
-      attempt === 0 ? prefix : `${prefix}_r${attempt}`,
-    );
-
-    const tmpPath = join(OUT_DIR, `_gate_${prefix.replace(/[^\w.-]+/g, "_")}.png`);
-    await writeFile(tmpPath, buf);
-    const gate = await checkIdentitySimilarity(tmpPath);
-    lastGate = gate;
-
-    if (gate.skipped) {
-      best = { buf, seed: attemptSeed, gate };
-      break;
+    let useIp = useIpAdapter;
+    let denoiseAttempt = denoise;
+    let buf;
+    try {
+      buf = await queueAndWait(
+        cfg.comfyUrl,
+        img2imgOpenPoseWorkflow(cfg, {
+          loraName,
+          sourceImageName: source?.uploadName,
+          poseMapName: poseName,
+          prompt,
+          negative,
+          seed: attemptSeed,
+          denoise: denoiseAttempt,
+          openPoseStrength: OPENPOSE_STRENGTH,
+          prefix: `id_${prefix}`,
+          backend,
+          faceImageName: faceUploadName,
+          useFaceId,
+          useIpAdapter: useIp,
+          ipAdapterImageName: ipAdapterUploadName || faceUploadName,
+          fromEmptyLatent,
+        }),
+        attempt === 0 ? prefix : `${prefix}_r${attempt}`,
+      );
+    } catch (err) {
+      const msg = String(err?.message || err);
+      if (useIp && /IPAdapter model not found|IPAdapterUnifiedLoader/i.test(msg)) {
+        console.log(
+          "  IP-Adapter models missing — falling back to low-denoise img2img (latent identity).",
+        );
+        useIp = false;
+        denoiseAttempt = Math.min(denoiseAttempt, 0.55);
+        if (denoiseAttempt >= 0.65 && !useFaceId) {
+          denoiseAttempt = 0.55;
+        }
+        buf = await queueAndWait(
+          cfg.comfyUrl,
+          img2imgOpenPoseWorkflow(cfg, {
+            loraName,
+            sourceImageName: source?.uploadName,
+            poseMapName: poseName,
+            prompt,
+            negative,
+            seed: attemptSeed,
+            denoise: denoiseAttempt,
+            openPoseStrength: OPENPOSE_STRENGTH,
+            prefix: `id_${prefix}`,
+            backend,
+            faceImageName: faceUploadName,
+            useFaceId,
+            useIpAdapter: false,
+            fromEmptyLatent,
+          }),
+          `${prefix}_noip_r${attempt}`,
+        );
+      } else {
+        throw err;
+      }
     }
 
-    const sim = gate.similarity ?? -1;
-    if (sim > bestSim) {
-      bestSim = sim;
-      best = { buf, seed: attemptSeed, gate };
+    const tmpPath = join(OUT_DIR, `_gate_${prefix.replace(/[^\w.-]+/g, "_")}.png`);
+    // Always bake solid chroma after generation so LoRA never learns rooms.
+    let plateBuf = buf;
+    try {
+      const plate = await toChromaTrainingPlate(buf, {
+        width: cfg.width || 512,
+        height: cfg.height || 768,
+      });
+      plateBuf = plate.buffer;
+      if (!plate.rembg) {
+        console.log(`  chroma post: rembg fallback (${plate.error || "n/a"})`);
+      }
+    } catch (err) {
+      console.log(`  chroma post failed: ${err.message || err}`);
+    }
+    await writeFile(tmpPath, plateBuf);
+    const gate = await checkPlateGates(tmpPath);
+    lastGate = gate;
+
+    const score =
+      (gate.chroma?.pass ? 2 : 0) +
+      (gate.palette?.pass ? 2 : 0) +
+      (gate.face && !gate.face.skipped && gate.face.pass ? 3 : 0) +
+      (Number(gate.similarity) || 0);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = { buf: plateBuf, seed: attemptSeed, gate };
     }
 
     if (gate.pass) {
       console.log(
-        `  identity_gate=pass sim=${sim.toFixed(3)} (threshold ${IDENTITY_THRESHOLD})`,
+        `  plate_gate=pass` +
+          (gate.similarity != null ? ` face_sim=${Number(gate.similarity).toFixed(3)}` : "") +
+          (gate.palette?.distance != null
+            ? ` paletteΔ=${gate.palette.distance.toFixed(1)}`
+            : "") +
+          (gate.chroma?.ratio != null
+            ? ` chroma=${gate.chroma.ratio.toFixed(2)}`
+            : ""),
       );
       break;
     }
 
     console.log(
-      `  identity_gate=reject sim=${sim.toFixed(3)} < ${IDENTITY_THRESHOLD} (retry ${attempt + 1}/${attempts})`,
+      `  plate_gate=reject [${(gate.reasons || [gate.reason]).join(", ")}] (retry ${attempt + 1}/${attempts})`,
     );
   }
 
   if (!best) throw new Error(`Identity gate produced no candidate for ${prefix}`);
-  if (!best.gate.skipped && !best.gate.pass) {
-    console.log(
-      `  identity_gate=warn keeping best sim=${(best.gate.similarity ?? bestSim).toFixed?.(3) ?? bestSim} after ${attempts} tries`,
+  if (!best.gate.pass) {
+    try {
+      await unlink(join(OUT_DIR, `_gate_${prefix.replace(/[^\w.-]+/g, "_")}.png`));
+    } catch {
+      /* ignore */
+    }
+    const why = (best.gate.reasons || [best.gate.reason || "gate_failed"]).join(", ");
+    throw new Error(
+      `plate_gate HARD FAIL for ${prefix}: ${why} after ${attempts} tries (not writing)`,
     );
-  } else if (best.gate.skipped && best.gate.reason === "skipped_no_face") {
-    console.log("  identity_gate=skipped_no_face");
   }
 
   await writeFile(outPath, best.buf);
@@ -1505,16 +1811,25 @@ async function main() {
       const src = resolveLocalPath(SET_MASTER);
       if (!existsSync(src)) throw new Error(`--set-master not found: ${src}`);
       await mkdir(OUT_DIR, { recursive: true });
-      await copyFile(src, MASTER_PATH);
-      await ensureFaceLockFromRealImage(src, "--set-master");
+      const raw = await readFile(src);
+      const w = cfg.width || 512;
+      const h = cfg.height || 768;
+      console.log(`\n[1] Installing set-master → chroma training plate ${w}×${h}`);
+      const plate = await toChromaTrainingPlate(raw, { width: w, height: h });
+      if (!plate.rembg) {
+        console.log(`  warn: rembg failed (${plate.error || "unknown"}) — using contain-on-chroma fallback`);
+      } else {
+        console.log("  rembg cutout → solid #00FF00");
+      }
+      await writeFile(MASTER_PATH, plate.buffer);
+      await ensureFaceLockFromRealImage(MASTER_PATH, "--set-master");
       await clearMasterApproval("new master installed via --set-master");
       masterJustCreated = true;
-      console.log(`\n[1] Master installed from file ? ${MASTER_PATH}`);
-      if (cfg.openImages !== false) openFile(MASTER_PATH);
+      console.log(`\n[1] Master installed from file → ${MASTER_PATH}`);
+      if (shouldOpenImages(cfg)) openFile(MASTER_PATH);
     }
 
     const forceNewMaster = shouldForceNewMaster();
-    const masterSeed = resolveMasterInventSeed();
     if (MASTER_ONLY && isMasterApproved() && !FORCE && !SET_MASTER) {
       console.log(`\n[1] Master already APPROVED: ${MASTER_PATH}`);
       console.log("  Re-run with --force to replace it (clears approval).");
@@ -1532,9 +1847,9 @@ async function main() {
           faceSrc,
           faceSrc === MASTER_PATH ? "master" : "existing face_lock",
         );
-        console.log(`\n[1a] FaceID source ? master / face_lock`);
+        console.log(`\n[1a] FaceID source → master / face_lock`);
       } else if (refPath) {
-        console.log("\n[1a] FaceID source ? real reference image");
+        console.log("\n[1a] FaceID source → real reference image");
         await ensureFaceLockFromRealImage(refPath, "--ref / referenceImage");
         const refCopy = join(OUT_DIR, "reference.png");
         if (refPath !== refCopy) await copyFile(refPath, refCopy);
@@ -1575,13 +1890,14 @@ async function main() {
       if (backend.name === "faceid" && !faceUploadName && !textBootstrap) {
         throw new Error("FaceID required for master generation but no face reference was uploaded.");
       }
+      const candidateCount = MASTER_ONLY ? MASTER_CANDIDATES : 1;
       if (textBootstrap) {
         console.log(
-          "\n[1b] Generating master from text + OpenPose (no FaceID — review required)…",
+          `\n[1b] Generating ${candidateCount} master candidate(s) from text + OpenPose (no FaceID — review required)…`,
         );
       } else {
         console.log(
-          "\n[1b] Generating master identity (FaceID + OpenPose — review required)…",
+          `\n[1b] Generating ${candidateCount} master candidate(s) (FaceID + OpenPose — review required)…`,
         );
       }
       const { poseName } = await uploadPose(
@@ -1589,34 +1905,80 @@ async function main() {
         { angleKey: "front", poseKey: "stand" },
         "master_front_stand",
       );
-      const masterBuf = await queueAndWait(
-        cfg.comfyUrl,
-        masterIdentityWorkflow(cfg, {
-          loraName,
-          poseMapName: poseName,
-          faceImageName: textBootstrap ? null : faceUploadName,
-          backend: textBootstrap ? { name: "none" } : backend,
-          seed: masterSeed,
-        }),
-        "master",
-      );
-      await writeFile(MASTER_PATH, masterBuf);
+      const mastersDir = join(OUT_DIR, "masters");
+      if (candidateCount > 1) await mkdir(mastersDir, { recursive: true });
+      const candidateMeta = [];
+      let lastSeed = null;
+      for (let i = 0; i < candidateCount; i++) {
+        const masterSeed =
+          SEED_FLAG != null && i === 0
+            ? resolveMasterInventSeed()
+            : randomInt(0, 2 ** 32);
+        lastSeed = masterSeed;
+        const label =
+          candidateCount > 1 ? `master_cand_${String(i + 1).padStart(2, "0")}` : "master";
+        console.log(`  candidate ${i + 1}/${candidateCount} seed=${masterSeed}`);
+        const masterBuf = await queueAndWait(
+          cfg.comfyUrl,
+          masterIdentityWorkflow(cfg, {
+            loraName,
+            poseMapName: poseName,
+            faceImageName: textBootstrap ? null : faceUploadName,
+            backend: textBootstrap ? { name: "none" } : backend,
+            seed: masterSeed,
+          }),
+          label,
+        );
+        if (candidateCount > 1) {
+          const candName = `candidate_${String(i + 1).padStart(2, "0")}.png`;
+          const candPath = join(mastersDir, candName);
+          await writeFile(candPath, masterBuf);
+          candidateMeta.push({ file: candName, seed: masterSeed, at: new Date().toISOString() });
+          console.log(`  → ${candPath}`);
+          // Preview box uses master_identity.png — keep latest candidate there.
+          await writeFile(MASTER_PATH, masterBuf);
+        } else {
+          await writeFile(MASTER_PATH, masterBuf);
+        }
+      }
+      if (candidateCount > 1) {
+        await writeFile(
+          join(mastersDir, "index.json"),
+          JSON.stringify(
+            {
+              count: candidateCount,
+              generatedAt: new Date().toISOString(),
+              candidates: candidateMeta,
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+      }
       // Use master itself as face_lock for later continuity (may still be cartoon for InsightFace)
       await copyFile(MASTER_PATH, FACE_LOCK);
-      await writeMasterSeedRecord(masterSeed, {
-        source: SEED_FLAG != null ? "cli --seed" : "random",
+      await writeMasterSeedRecord(lastSeed, {
+        source:
+          SEED_FLAG != null
+            ? "cli --seed"
+            : candidateCount > 1
+              ? `random batch x${candidateCount}`
+              : "random",
       });
       await clearMasterApproval("new master generated");
       masterJustCreated = true;
       console.log(`  → ${MASTER_PATH}`);
       console.log(`  face_lock ← master`);
       console.log(
-        SEED_FLAG != null
-          ? `  invent seed=${masterSeed} (--seed override)`
-          : `  invent seed=${masterSeed} (random candidate — approve to lock identity)`,
+        candidateCount > 1
+          ? `  ${candidateCount} candidates in masters/ — pick one in Character studio`
+          : SEED_FLAG != null
+            ? `  invent seed=${lastSeed} (--seed override)`
+            : `  invent seed=${lastSeed} (random candidate — approve to lock identity)`,
       );
       console.log(`  after approve: keyframes/shots use character seed=${cfg.seed}`);
-      if (cfg.openImages !== false) openFile(MASTER_PATH);
+      if (shouldOpenImages(cfg)) openFile(MASTER_PATH);
     } else if (!SET_MASTER) {
       console.log(`\n[1b] Existing master: ${MASTER_PATH}`);
       console.log(
@@ -1672,14 +2034,25 @@ async function main() {
   }
 
   // Cartoon masters often have no InsightFace-detectable face — FaceID would crash Comfy.
+  let ipAdapterUploadName = null;
   if (faceUploadName) {
     const probe = existsSync(FACE_LOCK) ? FACE_LOCK : MASTER_PATH;
     if (!(await insightFaceDetects(probe))) {
       console.log(
-        "  FaceID disabled: InsightFace found no face on face_lock (common for cartoons). Using img2img latent only.",
+        "  FaceID disabled: InsightFace found no face on face_lock (common for cartoons). Using IP-Adapter master reference.",
       );
+      ipAdapterUploadName = faceUploadName;
       faceUploadName = null;
     }
+  }
+  if (!ipAdapterUploadName && existsSync(MASTER_PATH)) {
+    ipAdapterUploadName = (
+      await uploadImage(
+        cfg.comfyUrl,
+        "id_ipadapter_master.png",
+        await readFile(MASTER_PATH),
+      )
+    ).name;
   }
 
   /** @type {Array<object>} */
@@ -1687,14 +2060,14 @@ async function main() {
 
   // ======================== PHASE 2: CANONICAL KEYFRAMES ========================
   // img2img from master / nearest keyframe. Never invent identity from noise
-  // unless controlled rebuild (profile / rear) ? then FaceID carries identity.
+  // unless controlled rebuild (profile / rear) — then FaceID/IP-Adapter carries identity.
   if (!SHOTS_ONLY) {
-    console.log("\n[2] Canonical keyframes (img2img from master / nearest)?");
+    console.log("\n[2] Canonical keyframes (img2img from master / nearest)");
 
     const frontPath = join(KEYFRAMES_DIR, "front.png");
-    if (!existsSync(frontPath) || FORCE_KEYFRAMES) {
+    if (!existsSync(frontPath) || (FORCE_KEYFRAMES && (!ONLY_IDS || ONLY_IDS.has("front")))) {
       await copyFile(MASTER_PATH, frontPath);
-      console.log("  front.png ? master (identity seed)");
+      console.log("  front.png ← master (identity seed)");
     } else {
       console.log("  reuse front.png");
     }
@@ -1706,6 +2079,7 @@ async function main() {
 
     for (const spec of keyframeSpecsFor(cfg)) {
       if (spec.id === "front") continue;
+      if (ONLY_IDS && !ONLY_IDS.has(spec.id)) continue;
       const outPath = join(KEYFRAMES_DIR, `${spec.id}.png`);
 
       if (existsSync(outPath) && !FORCE_KEYFRAMES) {
@@ -1714,18 +2088,24 @@ async function main() {
       }
 
       const shot = keyframeShotFromSpec(spec);
-      const { source, reason } = selectSource(shot, keyframeBank, null);
+      // Never img2img from the plate we're replacing (force remake would lock drift).
+      const bankForSource = keyframeBank.filter((k) => k.id !== spec.id);
+      const { source, reason } = selectSource(shot, bankForSource, null);
       let rebuild = needsEmptyLatentRebuild(shot, source);
       let denoise = rebuild ? 1 : denoiseForEdit(shot, source);
-      // Without FaceID, EmptyLatent invents identity — fall back to strong img2img instead.
+      // Without FaceID, EmptyLatent invents identity — fall back to strong img2img + IP-Adapter.
       if (rebuild && !faceUploadName) {
         rebuild = false;
-        denoise = Math.max(denoiseForEdit(shot, source), 0.85);
+        denoise = Math.max(denoiseForEdit(shot, source), 0.75);
       }
       const useFaceId = shouldUseFaceId(rebuild, denoise) && Boolean(faceUploadName);
+      const useIpAdapter =
+        !useFaceId &&
+        Boolean(ipAdapterUploadName) &&
+        (rebuild || denoise >= 0.5);
 
       console.log(
-        `  ${spec.id} ? ${reason} (${rebuild ? "REBUILD EmptyLatent+FaceID" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId})`,
+        `  ${spec.id} ← ${reason} (${rebuild ? "REBUILD EmptyLatent" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId} ipadapter=${useIpAdapter})`,
       );
 
       await runEdit(cfg, {
@@ -1739,18 +2119,20 @@ async function main() {
         loraName,
         backend,
         faceUploadName,
+        ipAdapterUploadName,
         fromEmptyLatent: rebuild,
         useFaceId,
+        useIpAdapter,
       });
 
-      console.log(`  ? ${outPath}`);
+      console.log(`  ✓ ${outPath}`);
       keyframeBank = await loadKeyframeBank(cfg);
     }
 
     keyframeBank = await loadKeyframeBank(cfg);
     console.log(`  Keyframe bank ready (${keyframeBank.length} frames).`);
   } else {
-    console.log("\n[2] Loading keyframe bank?");
+    console.log("\n[2] Loading keyframe bank");
     keyframeBank = await loadKeyframeBank(cfg);
     if (!keyframeBank.length) throw new Error("No keyframes found.");
   }
@@ -1802,12 +2184,16 @@ async function main() {
     let denoise = rebuild ? 1 : denoiseForEdit(shot, source);
     if (rebuild && !faceUploadName) {
       rebuild = false;
-      denoise = Math.max(denoiseForEdit(shot, source), 0.85);
+      denoise = Math.max(denoiseForEdit(shot, source), 0.75);
     }
     const useFaceId = shouldUseFaceId(rebuild, denoise) && Boolean(faceUploadName);
+    const useIpAdapter =
+      !useFaceId &&
+      Boolean(ipAdapterUploadName) &&
+      (rebuild || denoise >= 0.5);
 
     console.log(
-      `  (${i + 1}/${shots.length}) ${shot.id} ? ${reason} (${rebuild ? "REBUILD" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId})`,
+      `  (${i + 1}/${shots.length}) ${shot.id} ← ${reason} (${rebuild ? "REBUILD" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId} ipadapter=${useIpAdapter})`,
     );
 
     const result = await runEdit(cfg, {
@@ -1821,8 +2207,10 @@ async function main() {
       loraName,
       backend,
       faceUploadName,
+      ipAdapterUploadName,
       fromEmptyLatent: rebuild,
       useFaceId,
+      useIpAdapter,
     });
 
     lastAccepted = result;
@@ -1846,7 +2234,7 @@ async function main() {
       seedUsed: result.seedUsed ?? null,
     });
     console.log(`  ? ${imgPath}`);
-    if (cfg.openImages) openFile(imgPath);
+    if (shouldOpenImages(cfg)) openFile(imgPath);
   }
 
   const masterDs = join(IMAGES_DIR, `${cfg.trigger}_00_master_identity.png`);

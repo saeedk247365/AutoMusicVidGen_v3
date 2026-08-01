@@ -43,6 +43,7 @@ import {
   queueAndWait,
   extractVideoFromHistory,
   resetComfyExecution,
+  comfyNodeHasInput,
 } from "../lib/comfy-client.js";
 import { isSaladUrl } from "../lib/gpu-backend.js";
 import {
@@ -65,7 +66,7 @@ function songArgPath(songDir) {
   return relative(ROOT, songDir).replace(/\\/g, "/");
 }
 const MOTION_NEGATIVE =
-  "blurry, low quality, morphing face, extra limbs, distorted hands, text, watermark, photorealistic, sudden cut, flicker, outfit change, clothing morph, different clothes, hat, beanie, cap, bag, purse, handbag, glasses, accessories, white t-shirt on mom, pink pants on mom, coral blouse missing, mint shirt change, navy pants change, three people, second child, extra person, twin, kiss, kissing, hug, hugging, embrace, snuggle, cuddle, wrapping arms, holding child, fused bodies, morphing bodies, extra arms, claw hands";
+  "blurry, low quality, morphing face, extra limbs, distorted hands, melted hands, stump hands, blob fingers, fused fingers, text, watermark, photorealistic, sudden cut, flicker, outfit change, clothing morph, different clothes, hat, beanie, cap, bag, purse, handbag, glasses, eyeglasses, spectacles, accessories, white t-shirt on mom, pink pants on mom, coral blouse missing, mint shirt change, navy pants change, three people, second child, extra person, twin, twins, clone, duplicate child, doppelganger, mirrored child, second toddler, second Adam, child in sink, toddler in sink, daughter, sister, sibling, girl beside mom, sitting on counter, sitting on table, standing on table, standing on counter, climbing furniture, kiss, kissing, hug, hugging, embrace, snuggle, cuddle, wrapping arms, holding child, fused bodies, morphing bodies, extra arms, claw hands";
 
 function wanI2VWorkflow(cfg, imageName, motionPrompt, negative, seed, endImageName = null) {
   const wf = {
@@ -321,6 +322,7 @@ function motionPromptFor(
     kneel: "kneeling, slight torso sway",
     wave: "waving one hand gently",
     clap: "clapping hands slowly once or twice",
+    wash: "washing hands under the faucet, rubbing palms, five clear fingers each hand, soap splash, keep hands readable, standing on floor",
     walk: "walking in place, short steps",
     tiptoe: "tiptoeing softly in place, heels raised",
     sit: "sitting, soft posture shift",
@@ -610,7 +612,7 @@ async function animateSong(
   songDir,
   cfg,
   comfyUrl,
-  { kidsHit = false, frameChain = false } = {},
+  { kidsHit = false, frameChain = false, flfSupported = false } = {},
 ) {
   const keyframesDir = join(songDir, "keyframes");
   const clipsDir = join(songDir, "clips");
@@ -786,8 +788,8 @@ async function animateSong(
       : `family_kf_${stem}.png`;
     const uploaded = await uploadImage(comfyUrl, uploadName, buf);
     let endUploadedName = null;
-    // FLF2V: camera-end crop (or keyframe) so Wan pushes/pans toward end framing
-    if (kidsHit && !has("--no-flf")) {
+    // FLF2V: only when this Comfy WanImageToVideo build accepts end_image
+    if (kidsHit && flfSupported && !has("--no-flf")) {
       try {
         const parsed = parseKeyframeName(stem);
         const camCandidates = [];
@@ -1028,9 +1030,27 @@ async function main() {
     await resetComfyExecution(comfyUrl, { label: "pre-Wan" });
   }
 
+  let flfSupported = false;
+  if (kidsHit && !has("--no-flf")) {
+    flfSupported = await comfyNodeHasInput(
+      comfyUrl,
+      "WanImageToVideo",
+      "end_image",
+    );
+    console.log(
+      flfSupported
+        ? "  FLF: WanImageToVideo supports end_image"
+        : "  FLF: skipped — this Comfy Wan build has no end_image (plain I2V)",
+    );
+  }
+
   const targets = await listSongDirs(songArg || batchArg);
   for (const songDir of targets) {
-    await animateSong(songDir, cfg, comfyUrl, { kidsHit, frameChain });
+    await animateSong(songDir, cfg, comfyUrl, {
+      kidsHit,
+      frameChain,
+      flfSupported,
+    });
   }
 
   console.log("\n────────────────────────────────────────────────────────");
