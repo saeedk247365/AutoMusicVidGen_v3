@@ -1745,15 +1745,21 @@
       "btnStudioMaster",
       "btnStudioApprove",
       "btnStudioDataset",
+      "btnStudioPrepTrain",
       "btnStudioTrain",
       "btnStudioFaceRef",
       "btnStudioStill",
       "btnStudioDescribe",
       "studioCharSelect",
       "studioMasterCount",
+      "btnImportPoseBank",
+      "btnStudioDeleteChar",
     ]) {
       const el = $(id);
       if (el) el.disabled = !!busy;
+    }
+    if (!busy && $("btnStudioDeleteChar")) {
+      $("btnStudioDeleteChar").disabled = !studioId;
     }
   }
 
@@ -1921,6 +1927,7 @@
         url: img.url,
         label: img.id || img.file,
         gateFail: Boolean(img.gateFail),
+        manual: Boolean(img.manual),
       });
     }
     for (const img of images) {
@@ -1948,22 +1955,30 @@
     const hint = $("datasetLightboxHint");
     const busy = $("datasetLightboxBusy");
     const remake = $("btnLightboxRemake");
+    const replace = $("btnLightboxReplace");
     const edit = $("btnLightboxEdit");
     if (img) img.src = item.url;
     if (cap) {
-      cap.textContent = `${item.label} · ${item.kind} · ${studioSlideshowIndex + 1} / ${studioSlideshow.length}`;
+      const manualTag = item.manual ? " · manual" : "";
+      cap.textContent = `${item.label} · ${item.kind}${manualTag} · ${studioSlideshowIndex + 1} / ${studioSlideshow.length}`;
     }
     if (hint) {
       hint.textContent = item.gateFail
-        ? "Gate failed on this plate — Remake recommended."
+        ? "Gate failed on this plate — Remake or Replace recommended."
         : item.kind === "keyframe"
-          ? item.id === "front"
-            ? "front remakes by re-copying the approved master."
-            : "Remake regenerates this keyframe from the nearest source."
+          ? item.manual
+            ? "Manual / Gemini import. Replace to upload a new plate; Remake overwrites with Comfy."
+            : item.id === "front"
+              ? "front remakes by re-copying the approved master. Replace imports a new front (also updates master)."
+              : "Remake regenerates this keyframe from the nearest source. Replace uploads a Gemini/manual plate."
           : "Remake regenerates this training shot.";
     }
     if (busy) busy.hidden = !studioSlideshowRemaking;
     if (remake) remake.disabled = studioSlideshowRemaking;
+    if (replace) {
+      replace.hidden = item.kind !== "keyframe";
+      replace.disabled = studioSlideshowRemaking;
+    }
     if (edit) {
       edit.hidden = !(item.kind === "shot" && item.editable);
       edit.disabled = studioSlideshowRemaking;
@@ -2025,23 +2040,173 @@
         toast(`front.png re-copied from master`, "ok");
         studioSlideshowRemaking = false;
         await refreshStudioStatus();
-        // refresh current slide URL after status
-        const refreshed = studioSlideshow[studioSlideshowIndex];
+        const refreshed = studioSlideshow.find(
+          (s) => s.kind === item.kind && s.id === item.id,
+        );
         if (refreshed && $("datasetLightboxImg")) {
           $("datasetLightboxImg").src = refreshed.url;
         }
         syncLightboxUi();
         return;
       }
+      // Job started — wait for character-job SSE / status refresh
+      toast(`${item.label} remake queued`, "ok");
       if (data.job) {
         renderStudioJob(data.job);
         setStudioBusy(true);
         startStudioPoll();
       }
     } catch (err) {
-      toast(`Remake error: ${err.message || err}`, "error");
+      toast(`Remake failed: ${err.message || err}`, "error");
       studioSlideshowRemaking = false;
       syncLightboxUi();
+    }
+  }
+
+  async function replaceKeyframeFromFile(item, file) {
+    if (!studioId || !item || item.kind !== "keyframe" || !file) return;
+    if (studioSlideshowRemaking) return;
+    studioSlideshowRemaking = true;
+    syncLightboxUi();
+    toast(`Importing ${item.id}…`);
+    try {
+      const payload = await fileToBase64Payload(file);
+      const res = await fetch(
+        `/api/characters/${encodeURIComponent(studioId)}/keyframes/${encodeURIComponent(item.id)}/upload`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            imageBase64: payload.imageBase64,
+            ext: payload.ext,
+          }),
+        },
+      );
+      const data = await readApiJson(res);
+      if (!data.ok) {
+        toast(`Replace failed: ${data.error}`, "error");
+        studioSlideshowRemaking = false;
+        syncLightboxUi();
+        return;
+      }
+      toast(
+        data.masterUpdated
+          ? `${item.id} imported (master updated)`
+          : `${item.id} imported`,
+        "ok",
+      );
+      studioSlideshowRemaking = false;
+      await refreshStudioStatus();
+      const refreshed = studioSlideshow.find(
+        (s) => s.kind === "keyframe" && s.id === item.id,
+      );
+      if (refreshed) {
+        const idx = studioSlideshow.indexOf(refreshed);
+        if (idx >= 0) studioSlideshowIndex = idx;
+      }
+      syncLightboxUi();
+    } catch (err) {
+      toast(`Replace failed: ${err.message || err}`, "error");
+      studioSlideshowRemaking = false;
+      syncLightboxUi();
+    }
+  }
+
+  async function readApiJson(res) {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      const snippet = String(text || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 120);
+      throw new Error(
+        res.status === 413
+          ? "Upload too large. Try fewer / smaller images."
+          : `Server returned non-JSON (HTTP ${res.status})${snippet ? `: ${snippet}` : ""}`,
+      );
+    }
+  }
+
+  function poseBankFileStem(file) {
+    return String(file?.name || "")
+      .replace(/^.*[\\/]/, "")
+      .replace(/\.[^.]+$/, "")
+      .toLowerCase()
+      .trim();
+  }
+
+  async function importPoseBankFiles(fileList) {
+    if (!studioId) return toast("Select a character first", "error");
+    // Front must land first — it bootstraps master approval for the rest.
+    const files = [...(fileList || [])]
+      .slice(0, 20)
+      .sort((a, b) => {
+        const sa = poseBankFileStem(a);
+        const sb = poseBankFileStem(b);
+        if (sa === "front") return -1;
+        if (sb === "front") return 1;
+        return sa.localeCompare(sb);
+      });
+    if (!files.length) return;
+    toast(`Importing ${files.length} pose plate(s)…`);
+    setStudioBusy(true);
+    let importedCount = 0;
+    let skippedCount = 0;
+    /** @type {{ name: string, error: string }[]} */
+    const skipped = [];
+    try {
+      // One file per request so large Gemini banks don't hit the JSON body limit.
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        toast(`Importing ${i + 1}/${files.length}: ${file.name}…`);
+        const payload = await fileToBase64Payload(file);
+        const res = await fetch(
+          `/api/characters/${encodeURIComponent(studioId)}/keyframes/import-bank`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              files: [
+                {
+                  name: file.name,
+                  imageBase64: payload.imageBase64,
+                  ext: payload.ext,
+                },
+              ],
+            }),
+          },
+        );
+        const data = await readApiJson(res);
+        importedCount += data.importedCount || 0;
+        skippedCount += data.skippedCount || 0;
+        if (Array.isArray(data.skipped)) {
+          for (const row of data.skipped) {
+            skipped.push({
+              name: row.name || file.name,
+              error: row.error || "skipped",
+            });
+          }
+        }
+        if (!data.ok && !(data.importedCount > 0) && data.error) {
+          skipped.push({ name: file.name, error: data.error });
+          skippedCount += 1;
+        }
+      }
+      toast(
+        skippedCount > 0
+          ? `Imported ${importedCount} plate(s), skipped ${skippedCount}`
+          : `Imported ${importedCount} pose plate(s)`,
+        importedCount > 0 ? "ok" : "error",
+      );
+      if (skipped.length && skipped[0]?.error) {
+        toast(`${skipped[0].name}: ${skipped[0].error}`, "error");
+      }
+      await refreshStudioStatus();
+    } catch (err) {
+      toast(`Import failed: ${err.message || err}`, "error");
+    } finally {
+      setStudioBusy(false);
     }
   }
 
@@ -2114,10 +2279,15 @@
 
     const tileHtml = (item, index) => {
       const fail = item.gateFail ? " is-gate-fail" : "";
+      const manual = item.manual ? " is-manual" : "";
+      const badge = item.manual
+        ? `<em class="tile-manual-badge">manual</em>`
+        : "";
       return `<div class="studio-dataset-tile-wrap">
-        <button type="button" class="studio-dataset-tile${fail}" data-slide-index="${index}" title="${esc(item.label)}">
+        <button type="button" class="studio-dataset-tile${fail}${manual}" data-slide-index="${index}" title="${esc(item.label)}">
           <img src="${esc(item.url)}" alt="${esc(item.label)}" loading="lazy" />
           <span>${esc(item.label)}</span>
+          ${badge}
         </button>
         <button type="button" class="btn tiny primary tile-remake" data-remake-index="${index}">Remake</button>
       </div>`;
@@ -2264,11 +2434,15 @@
 
     const approve = $("btnStudioApprove");
     const dataset = $("btnStudioDataset");
+    const prep = $("btnStudioPrepTrain");
     const train = $("btnStudioTrain");
     const busy = !!data.job?.running;
+    const kf = Number(d.keyframeCount) || 0;
+    const imgs = Number(d.imageCount) || 0;
     if (approve) approve.disabled = busy || !m.exists || !!m.approved;
     if (dataset) dataset.disabled = busy || !m.approved;
-    if (train) train.disabled = busy || !(d.imageCount >= 4);
+    if (prep) prep.disabled = busy || !m.approved || kf < 1;
+    if (train) train.disabled = busy || !(imgs >= 4 || kf >= 4);
     setStudioBusy(busy);
     if (approve && m.approved) approve.textContent = "Approved";
     else if (approve) approve.textContent = "Approve";
@@ -2279,6 +2453,8 @@
     studioId = id || "";
     const body = $("studioBody");
     const emptyHint = $("studioEmptyHint");
+    const delBtn = $("btnStudioDeleteChar");
+    if (delBtn) delBtn.disabled = !id;
     if (!id) {
       if (body) body.hidden = true;
       if (emptyHint) emptyHint.hidden = false;
@@ -2300,7 +2476,40 @@
     if ($("studioAge")) $("studioAge").value = c.age || "";
     if ($("studioTrigger")) $("studioTrigger").value = c.trigger || "";
     renderStudioStatus(data);
+    await renderPoseGuide(id);
     if (data.job?.running) startStudioPoll();
+  }
+
+  async function deleteStudioCharacter() {
+    if (!studioId) return toast("Select a character first", "error");
+    const id = studioId;
+    const ok = window.confirm(
+      `Delete character "${id}"?\n\nThis permanently removes:\n• characters/${id}.json\n• dataset/${id}/ (master, keyframes, shots)\n• train-config-${id}.json\n• matching LoRA file if present\n\nYou can recreate the same name afterward.`,
+    );
+    if (!ok) return;
+    setStudioBusy(true);
+    toast(`Deleting ${id}…`);
+    try {
+      const res = await fetch(`/api/characters/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        toast(`Delete failed: ${data.error}`, "error");
+        return;
+      }
+      toast(`Deleted ${id}`, "ok");
+      studioId = "";
+      if ($("studioCharSelect")) $("studioCharSelect").value = "";
+      await loadStudioCharacter("");
+      const listRes = await fetch("/api/characters");
+      const listData = await listRes.json();
+      if (listData.ok) fillStudioSelect(listData.characters || []);
+    } catch (err) {
+      toast(`Delete failed: ${err.message || err}`, "error");
+    } finally {
+      setStudioBusy(false);
+    }
   }
 
   async function refreshStudioStatus() {
@@ -2308,6 +2517,58 @@
     const res = await fetch(`/api/characters/${encodeURIComponent(studioId)}`);
     const data = await res.json();
     if (data.ok) renderStudioStatus(data);
+    await renderPoseGuide(studioId);
+  }
+
+  async function renderPoseGuide(characterId) {
+    const list = $("studioPoseGuideList");
+    const tip = $("studioPoseGuideTip");
+    if (!list) return;
+    try {
+      const q = characterId
+        ? `?character=${encodeURIComponent(characterId)}`
+        : "";
+      const res = await fetch(`/api/character-pose-guide${q}`);
+      const data = await res.json();
+      if (!data.ok) {
+        list.innerHTML = `<p class="meta">${esc(data.error || "Guide unavailable")}</p>`;
+        return;
+      }
+      if (tip && data.tip) tip.textContent = data.tip;
+      const byGroup = new Map();
+      for (const p of data.poses || []) {
+        if (!p.required) continue;
+        const g = p.group || "Other";
+        if (!byGroup.has(g)) byGroup.set(g, []);
+        byGroup.get(g).push(p);
+      }
+      const blocks = [];
+      for (const [group, poses] of byGroup) {
+        const rows = poses
+          .map((p) => {
+            const state = p.present ? "is-present" : "is-missing";
+            const mark = p.present
+              ? p.manual
+                ? " ✓ manual"
+                : " ✓"
+              : " ○ need";
+            return `<div class="studio-pose-guide-row ${state}">
+              <code>${esc(p.file)}${mark}</code>
+              <span class="pose-title">${esc(p.title)}</span>
+              <p class="pose-hint">${esc(p.hint)}</p>
+            </div>`;
+          })
+          .join("");
+        blocks.push(
+          `<div class="studio-pose-guide-group"><h4>${esc(group)}</h4>${rows}</div>`,
+        );
+      }
+      list.innerHTML =
+        blocks.join("") ||
+        `<p class="meta">Select a character to see which poses you still need.</p>`;
+    } catch (err) {
+      list.innerHTML = `<p class="meta">${esc(err.message || err)}</p>`;
+    }
   }
 
   function startStudioPoll() {
@@ -2343,6 +2604,10 @@
 
   $("studioCharSelect")?.addEventListener("change", async (ev) => {
     await loadStudioCharacter(ev.target.value);
+  });
+
+  $("btnStudioDeleteChar")?.addEventListener("click", () => {
+    deleteStudioCharacter();
   });
 
   $("studioCandidates")?.addEventListener("click", async (ev) => {
@@ -2387,6 +2652,27 @@
   $("btnLightboxRemake")?.addEventListener("click", () => {
     const item = studioSlideshow[studioSlideshowIndex];
     if (item) remakeSlideshowItem(item);
+  });
+  $("btnLightboxReplace")?.addEventListener("click", () => {
+    const item = studioSlideshow[studioSlideshowIndex];
+    if (!item || item.kind !== "keyframe") return;
+    $("studioKeyframeReplaceInput")?.click();
+  });
+  $("btnImportPoseBank")?.addEventListener("click", () => {
+    $("studioPoseBankInput")?.click();
+  });
+  $("studioPoseBankInput")?.addEventListener("change", async (ev) => {
+    const files = [...(ev.target.files || [])];
+    ev.target.value = "";
+    if (!files.length) return;
+    await importPoseBankFiles(files);
+  });
+  $("studioKeyframeReplaceInput")?.addEventListener("change", async (ev) => {
+    const file = ev.target.files?.[0];
+    ev.target.value = "";
+    const item = studioSlideshow[studioSlideshowIndex];
+    if (!file || !item || item.kind !== "keyframe") return;
+    await replaceKeyframeFromFile(item, file);
   });
   $("btnLightboxEdit")?.addEventListener("click", () => {
     const item = studioSlideshow[studioSlideshowIndex];
@@ -2460,7 +2746,10 @@
       }),
     });
     const data = await res.json();
-    log(data.ok ? `Saved ${studioId} prompts` : `Save failed: ${data.error}`);
+    if (!data.ok) return toast(`Save failed: ${data.error}`, "error");
+    if (data.warning) toast(data.warning, "error");
+    else toast(`Saved ${studioId}`, "ok");
+    await refreshStudioStatus();
   });
 
   async function postStudioAction(path, label, body = {}) {
@@ -2485,7 +2774,9 @@
       startStudioPoll();
     } else {
       await refreshStudioStatus();
-      toast(`${label} done`, "ok");
+      if (data.warning) toast(data.warning, "error");
+      else if (data.styleAlign?.warning) toast(data.styleAlign.warning, "error");
+      else toast(`${label} done`, "ok");
     }
   }
 
@@ -2677,6 +2968,28 @@
   $("btnStudioDataset")?.addEventListener("click", () =>
     postStudioAction("/dataset", "Generate dataset"),
   );
+  $("btnStudioPrepTrain")?.addEventListener("click", async () => {
+    if (!studioId) return;
+    setStudioBusy(true);
+    toast("Preparing LoRA set from keyframes…");
+    try {
+      const res = await fetch(
+        `/api/characters/${encodeURIComponent(studioId)}/prepare-training`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      );
+      const data = await res.json();
+      if (!data.ok) {
+        toast(`Prepare failed: ${data.error}`, "error");
+        return;
+      }
+      toast(`Prepared ${data.copied} training image(s) — you can Train LoRA`, "ok");
+      await refreshStudioStatus();
+    } catch (err) {
+      toast(`Prepare failed: ${err.message || err}`, "error");
+    } finally {
+      setStudioBusy(false);
+    }
+  });
   $("btnStudioTrain")?.addEventListener("click", () =>
     postStudioAction("/train", "Train LoRA"),
   );

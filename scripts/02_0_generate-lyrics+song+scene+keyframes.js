@@ -111,6 +111,8 @@ const CHARACTERS_DIR = join(ROOT, "characters");
 /** Default cast — override with --cast id1,id2 */
 let CAST_IDS = ["adam", "sasha"];
 let CHAR_NAME_RE = /^(adam|sasha)$/i;
+/** Populated by loadFamilyCast() — used to remap Adam plans onto custom leads. */
+let ACTIVE_CAST = {};
 let ALLOWED_LOCATION_IDS = null;
 let LOCKED_TITLE = "";
 let LOCKED_OBJECTIVE = "";
@@ -138,6 +140,43 @@ function applyCastCli(flagFn) {
   }
   LOCKED_TITLE = String(flagFn("--title", "") || "").trim();
   LOCKED_OBJECTIVE = String(flagFn("--objective", "") || "").trim();
+}
+
+/** When resuming a song folder without --cast, reuse mvid-session cast/locations. */
+function applySessionCastFallback(songArg, flagFn) {
+  if (!songArg || flagFn("--cast", null)) return;
+  try {
+    const songDir = resolve(
+      songArg.match(/^[A-Za-z]:[\\/]/) || songArg.startsWith("/")
+        ? songArg
+        : join(ROOT, songArg),
+    );
+    const sessionPath = join(songDir, "mvid-session.json");
+    if (!existsSync(sessionPath)) return;
+    const session = JSON.parse(stripBom(readFileSync(sessionPath, "utf8")));
+    if (Array.isArray(session.castIds) && session.castIds.length) {
+      CAST_IDS = session.castIds.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
+      const alt = CAST_IDS.map((id) =>
+        id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      ).join("|");
+      CHAR_NAME_RE = new RegExp(`^(${alt})$`, "i");
+    }
+    if (
+      !flagFn("--locations", null) &&
+      Array.isArray(session.locationIds) &&
+      session.locationIds.length
+    ) {
+      ALLOWED_LOCATION_IDS = session.locationIds
+        .map((s) => String(s).trim().toLowerCase())
+        .filter(Boolean);
+    }
+    if (!LOCKED_TITLE && session.title) LOCKED_TITLE = String(session.title).trim();
+    if (!LOCKED_OBJECTIVE && session.objective) {
+      LOCKED_OBJECTIVE = String(session.objective).trim();
+    }
+  } catch {
+    /* ignore — fall through to default cast */
+  }
 }
 const ACE_ROOT =
   "C:\\Users\\Saeed Khan\\AppData\\Local\\ProdesecStudio\\ACE-Step-1.5";
@@ -483,6 +522,149 @@ function titleCaseName(c) {
   return s[0].toUpperCase() + s.slice(1).toLowerCase();
 }
 
+/** Lead toddler + optional second cast member from CAST_IDS. */
+function resolveActiveCastRoles(cast = ACTIVE_CAST) {
+  const ids = CAST_IDS.length ? [...CAST_IDS] : ["adam", "sasha"];
+  const leadId =
+    ids.find((id) => {
+      const role = String(cast?.[id]?.role || "").toLowerCase();
+      return role !== "mom" && role !== "dad" && !/^sasha$/i.test(id);
+    }) || ids[0];
+  const helperId = ids.find((id) => id !== leadId) || null;
+  return {
+    leadId,
+    leadName: titleCaseName(cast?.[leadId]?.name || leadId),
+    helperId,
+    helperName: helperId
+      ? titleCaseName(cast?.[helperId]?.name || helperId)
+      : null,
+  };
+}
+
+/** Map plan names (Adam/Sasha or active cast) onto the loaded cast. */
+function remapCharacterName(rawName, roles) {
+  const name = titleCaseName(rawName);
+  if (!name) return null;
+  if (CHAR_NAME_RE.test(name)) return name;
+  if (/^adam$/i.test(name)) return roles.leadName;
+  if (/^sasha$/i.test(name)) return roles.helperName;
+  return null;
+}
+
+function remapPlacementKeys(placement, roles) {
+  if (!placement || typeof placement !== "object") return {};
+  const out = {};
+  for (const [k, v] of Object.entries(placement)) {
+    const nk = remapCharacterName(k, roles);
+    if (nk && out[nk] == null) out[nk] = v;
+  }
+  return out;
+}
+
+function applyCastRolesToBeats(beats, roles) {
+  const rewrite = (s) => {
+    let t = String(s || "");
+    if (!t) return t;
+    t = t.replace(/\bAdam\b/g, roles.leadName).replace(/\badam\b/g, roles.leadName);
+    if (roles.helperName) {
+      t = t
+        .replace(/\bSasha\b/g, roles.helperName)
+        .replace(/\bsasha\b/g, roles.helperName);
+    } else {
+      t = t
+        .replace(/\bSasha\b/gi, roles.leadName)
+        .replace(/\bMom\b/g, roles.leadName)
+        .replace(/\bmom\b/g, roles.leadName)
+        .replace(/\bher hand\b/gi, "his hand")
+        .replace(/\bat her\b/gi, "at him")
+        .replace(/\blooks up at Sasha\b/gi, `looks around`)
+        .replace(/\blooks at her\b/gi, "looks ahead");
+    }
+    return t;
+  };
+  return (beats || []).map((beat) => {
+    let characters = (Array.isArray(beat.characters) ? beat.characters : [])
+      .map((c) => {
+        if (c && typeof c === "object") {
+          const name = remapCharacterName(c.name, roles);
+          if (!name) return null;
+          return { ...c, name };
+        }
+        const name = remapCharacterName(c, roles);
+        return name ? { name, pose: "stand", expression: "happy", facing: "front" } : null;
+      })
+      .filter(Boolean);
+    const seen = new Set();
+    characters = characters.filter((c) => {
+      if (seen.has(c.name)) return false;
+      seen.add(c.name);
+      return true;
+    });
+    if (!characters.length) {
+      characters = [
+        {
+          name: roles.leadName,
+          pose: "stand",
+          expression: "happy",
+          facing: "front",
+        },
+      ];
+    }
+    // Solo cast: drop any leftover helper
+    if (!roles.helperName) {
+      characters = characters.filter((c) => c.name === roles.leadName);
+      if (!characters.length) {
+        characters = [
+          {
+            name: roles.leadName,
+            pose: "stand",
+            expression: "happy",
+            facing: "front",
+          },
+        ];
+      }
+    }
+    const placement = remapPlacementKeys(beat.placement, roles);
+    if (!placement[roles.leadName]) {
+      placement[roles.leadName] =
+        beat.placement?.Adam ||
+        beat.placement?.adam ||
+        Object.values(beat.placement || {})[0] ||
+        "center";
+    }
+    if (!roles.helperName) {
+      for (const k of Object.keys(placement)) {
+        if (k !== roles.leadName) delete placement[k];
+      }
+    }
+    const next = {
+      ...beat,
+      characters,
+      placement,
+      cause: rewrite(beat.cause),
+      effect: rewrite(beat.effect),
+      interaction: rewrite(beat.interaction),
+      lyricHint: rewrite(beat.lyricHint),
+    };
+    if (beat.endPlacement) {
+      const endPlacement = remapPlacementKeys(beat.endPlacement, roles);
+      if (!endPlacement[roles.leadName]) {
+        endPlacement[roles.leadName] =
+          beat.endPlacement?.Adam ||
+          beat.endPlacement?.adam ||
+          placement[roles.leadName];
+      }
+      if (!roles.helperName) {
+        for (const k of Object.keys(endPlacement)) {
+          if (k !== roles.leadName) delete endPlacement[k];
+        }
+      }
+      next.endPlacement = endPlacement;
+    }
+    return next;
+  });
+}
+
 function normalizePoseId(raw) {
   const s = String(raw || "")
     .toLowerCase()
@@ -659,6 +841,7 @@ async function loadFamilyCast() {
     }
     cast[id] = await loadJson(path);
   }
+  ACTIVE_CAST = cast;
   const scenes = await loadJson(join(SCENES_DIR, "scenes.json"));
   return { cast, scenes };
 }
@@ -678,12 +861,21 @@ function comfyCfg(characterRoot, overrides = {}) {
   };
 }
 
-function resolveLoraName(char) {
+function resolveLoraName(char, { required = false } = {}) {
   const name = char.loraName || null;
-  if (!name) return null;
+  if (!name) {
+    if (required) {
+      throw new Error(
+        `Character ${char.id} has no loraName — set it or train a LoRA before keyframes.`,
+      );
+    }
+    return null;
+  }
   const abs = join(COMFY_ROOT, "models", "loras", name);
   if (!existsSync(abs)) {
-    console.warn(`  LoRA missing for ${char.id}: ${name} (text-only fallback)`);
+    const msg = `LoRA missing for ${char.id}: ${name} (expected ${abs}). Train LoRA in Character Studio first — refusing text-only identity.`;
+    if (required) throw new Error(msg);
+    console.warn(`  ${msg}`);
     return null;
   }
   return name;
@@ -704,16 +896,23 @@ function sanitizeSceneStill(text) {
 
 /** Shared identity stills (ref only). */
 function buildCharPrompt(char, kf, actionExtra = "") {
+  const gender = String(char.gender || "").toLowerCase();
+  const genderLock =
+    gender === "boy" || gender === "male"
+      ? "toddler boy, male child, masculine boy face, short boy hair, NOT a girl, NOT feminine"
+      : gender === "girl" || gender === "female"
+        ? "toddler girl, female child, feminine girl face, NOT a boy"
+        : "";
   return [
     char.trigger,
     char.style || char.styleTag,
+    genderLock,
     char.appearance,
     char.outfit,
     kf.angle,
     kf.pose,
+    char.age,
     actionExtra,
-    "single character only",
-    STUDIO_BG_PROMPT,
   ]
     .filter(Boolean)
     .join(", ");
@@ -756,19 +955,31 @@ function buildPlatePrompt(char, frame, beat) {
     }
   }
 
+  const gender = String(char.gender || "").toLowerCase();
+  const boyLock =
+    gender === "boy" || gender === "male" || (!isMom && !gender)
+      ? "toddler boy, male child only, masculine boy face, NOT a girl, NOT feminine, no long hair"
+      : gender === "girl" || gender === "female"
+        ? "toddler girl, female child only, NOT a boy"
+        : null;
+  const outfitLock = isMom
+    ? "OUTFIT LOCK: button-front solid soft coral pink short-sleeve BLOUSE (not a t-shirt), solid cream long dress pants (not leggings), plain white sneakers, coral blouse, cream pants, woven blouse fabric, collar blouse"
+    : `OUTFIT LOCK: ${char.outfit || "solid toddler clothes, same outfit every image"}`;
+
   return [
     // Outfit FIRST so it outweighs LoRA clothing priors
-    isMom
-      ? "OUTFIT LOCK: button-front solid soft coral pink short-sleeve BLOUSE (not a t-shirt), solid cream long dress pants (not leggings), plain white sneakers, coral blouse, cream pants, woven blouse fabric, collar blouse"
-      : "OUTFIT LOCK: mint green crew neck t-shirt, navy toddler pants, white sneakers",
+    outfitLock,
     char.trigger,
     "masterpiece character plate",
     char.styleTag || char.style,
-    // Force Mom into same cel look as Adam LoRA (no soft painterly mismatch)
-    "flat 2D anime cartoon illustration, clean cel shading, bold black lineart, hard outlines, preschool cartoon, same style as toddler character plates",
+    boyLock,
+    // Match checkpoint styleFamily when present; default cel-friendly lock
+    String(char.styleFamily || "").toLowerCase() === "kids3d"
+      ? "cute 3d kids cartoon, soft rounded forms, pixar-like toddler, coherent CGI cartoon"
+      : "flat 2D anime cartoon illustration, clean cel shading, bold black lineart, hard outlines, preschool cartoon, same style as toddler character plates",
     isMom
       ? "bold ink outlines, flat color fills, NOT soft painterly, NOT semi-realistic, NOT 3d"
-      : "clean cel shading",
+      : "clean shading",
     char.appearance,
     char.outfit,
     isMom
@@ -790,7 +1001,11 @@ function buildPlatePrompt(char, frame, beat) {
     contactFacing || CANONICAL_FACINGS[facingId],
     contactPose || CANONICAL_POSES[poseId],
     CANONICAL_EXPRESSIONS[exprId],
-    isMom ? "exactly one adult mom" : "exactly one toddler boy",
+    isMom
+      ? "exactly one adult mom"
+      : boyLock
+        ? "exactly one toddler boy"
+        : "exactly one toddler",
     "single character only",
     "EMPTY FRAME except one character, no other people, no baby, no doll, no phantom child, no twin, no clone",
     STUDIO_BG_PROMPT,
@@ -1294,6 +1509,7 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
   if (!Array.isArray(data?.beats) || data.beats.length === 0) {
     throw new Error("Scene plan missing beats[]");
   }
+  const roles = resolveActiveCastRoles(opts.cast || ACTIVE_CAST);
   let beats = data.beats.map((b, i) => {
     let loc = normalizeLocation(b.location, allowedLocations, i);
     const camera = normalizeCameraId(b.camera);
@@ -1310,8 +1526,8 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
     if (rawChars.length > 0 && typeof rawChars[0] === "object" && rawChars[0]?.name) {
       charObjs = rawChars
         .map((c) => {
-          const name = titleCaseName(c.name);
-          if (!CHAR_NAME_RE.test(name)) return null;
+          const name = remapCharacterName(c.name, roles);
+          if (!name) return null;
           return {
             name,
             pose: normalizePoseId(c.pose),
@@ -1323,8 +1539,8 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
     } else if (legacyKfs.length > 0) {
       const seen = new Set();
       for (const k of legacyKfs) {
-        const name = titleCaseName(k.character || k.name);
-        if (!CHAR_NAME_RE.test(name) || seen.has(name)) continue;
+        const name = remapCharacterName(k.character || k.name, roles);
+        if (!name || seen.has(name)) continue;
         seen.add(name);
         const blob = [k.pose, k.prompt_extra, b.action].filter(Boolean).join(" ");
         charObjs.push({
@@ -1336,8 +1552,8 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
       }
     } else {
       charObjs = rawChars
-        .map((c) => titleCaseName(c))
-        .filter((c) => CHAR_NAME_RE.test(c))
+        .map((c) => remapCharacterName(c, roles))
+        .filter(Boolean)
         .map((name) => ({
           name,
           pose: normalizePoseId(b.action),
@@ -1346,21 +1562,27 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
         }));
     }
 
-    // Allowed cast: Adam and/or Sasha (drop Tom etc.)
-    charObjs = charObjs.filter((c) => CHAR_NAME_RE.test(c.name));
+    // Deduplicate; ensure lead toddler is present
+    const seenNames = new Set();
+    charObjs = charObjs.filter((c) => {
+      if (seenNames.has(c.name)) return false;
+      seenNames.add(c.name);
+      return true;
+    });
     if (charObjs.length === 0) {
       charObjs = [
         {
-          name: "Adam",
+          name: roles.leadName,
           pose: normalizePoseId(b.action),
           expression: normalizeExpressionId(b.action),
           facing: "front",
         },
       ];
     }
-    // Prefer Adam first, then Sasha; max 2
+    // Prefer lead first, then helper; max 2
     charObjs.sort((a, b) => {
-      const rank = (n) => (/^adam$/i.test(n) ? 0 : /^sasha$/i.test(n) ? 1 : 2);
+      const rank = (n) =>
+        n === roles.leadName ? 0 : n === roles.helperName ? 1 : 2;
       return rank(a.name) - rank(b.name);
     });
     charObjs = charObjs.slice(0, 2);
@@ -1368,20 +1590,19 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
       c.name = titleCaseName(c.name);
     }
 
-    const placement = {};
+    const placement = remapPlacementKeys(b.placement, roles);
     for (let ci = 0; ci < charObjs.length; ci++) {
       const nm = charObjs[ci].name;
+      if (placement[nm]) continue;
       const rawSlot =
         b.placement?.[nm] ||
         b.placement?.[nm.toLowerCase()] ||
-        (typeof charObjs[ci] === "object" && charObjs[ci].placement) ||
-        (charObjs.length === 1 ? "center" : ci === 0 ? "left" : "right");
-      placement[nm] = normalizePlacementSlot(rawSlot, ci === 0 ? "center" : "right");
-    }
-    if (!placement.Adam && charObjs.some((c) => c.name === "Adam")) {
-      placement.Adam = normalizePlacementSlot(
-        b.placement?.Adam || b.placement?.adam || "left",
-        "left",
+        (ci === 0
+          ? b.placement?.Adam || b.placement?.adam || "center"
+          : b.placement?.Sasha || b.placement?.sasha || "right");
+      placement[nm] = normalizePlacementSlot(
+        rawSlot,
+        ci === 0 ? "center" : "right",
       );
     }
 
@@ -1451,7 +1672,11 @@ function normalizeBeatPlan(data, allowedLocations, opts = {}) {
       durationSec: dur,
       lyricsText: opts.lyricsText || "",
       musicMap: opts.musicMap || null,
+      leadName: roles.leadName,
+      helperName: roles.helperName,
     });
+    // Remap any leftover Adam/Sasha labels onto active cast (e.g. Joseph-only)
+    result.beats = applyCastRolesToBeats(result.beats, roles);
     result.durationSec = dur;
     result.kidsHit = true;
     result.mood = kidsHitMood(theme);
@@ -1539,8 +1764,18 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
     if (ctx.lockedObjective) {
       prompt += `LOCKED OBJECTIVE (use exactly): ${ctx.lockedObjective}\n`;
     }
-    if (ctx.castNames) prompt += `Cast in this song: ${ctx.castNames}\n`;
-    if (ctx.locations) prompt += `Allowed places: ${ctx.locations}\n`;
+    if (ctx.castNames) {
+      prompt += `Cast in this song (ONLY these people — do not invent Mom/Sasha/Adam extras): ${ctx.castNames}\n`;
+      if (!/,/.test(ctx.castNames)) {
+        prompt += `SOLO CAST: one child only. Never mention Mom, Sasha, dad, or a second child.\n`;
+      }
+    }
+    if (ctx.locations) {
+      prompt += `Allowed places (lyrics must match these rooms only): ${ctx.locations}\n`;
+      if (/backyard|lawn|porch|yard/i.test(ctx.locations)) {
+        prompt += `OUTDOOR LOCK: problem/discovery must be outdoor (shoes, stomping, clapping, yard) — NEVER bed, blanket, pillow, sheets, or sink.\n`;
+      }
+    }
   }
   const system = ctx.kidsHit
     ? "You are a preschool hit songwriter. Output TITLE, OBJECTIVE, then LYRICS with [Intro] [Verse 1] [Chorus] [Verse 2] [Chorus] [Outro]. Write CHANTABLE singalong lines kids would shout — rhyme, hooks, repeated chorus. Do NOT narrate scenes/poses/camera (no 'Mom kneels', 'I look up'). Never truncate the last line."
@@ -1552,7 +1787,7 @@ async function qwenGenerateLyrics(model, temperature, ctx) {
     try {
       const retryHint =
         ctx.kidsHit && attempt > 1
-          ? `\n\nRETRY ${attempt}: EVERY lyric line MUST be a COMPLETE thought of 6 words or fewer. Never end mid-phrase. MUST include section headers exactly:\n[Intro]\n...\n[Verse 1]\n...\n[Chorus]\n...\n[Verse 2]\n...\n[Chorus]\n...\n[Outro]\n...\nBad: "I'm stuck in my bed, can't". Good: "Stuck in bed now." "Blanket too tight." "Mom kneels by me."`
+          ? `\n\nRETRY ${attempt}: EVERY lyric line MUST be a COMPLETE thought of 6 words or fewer. Never end mid-phrase. MUST include section headers exactly:\n[Intro]\n...\n[Verse 1]\n...\n[Chorus]\n...\n[Verse 2]\n...\n[Chorus]\n...\n[Outro]\n...\nBad: "I'm stuck in my bed, can't". Good outdoor/stomp: "Shoes feel stuck." "Can't stomp yet." "Clap with both hands." Never use bed/blanket unless the theme is bedtime.`
           : "";
       const content = await ollamaChat(
         model,
@@ -2184,7 +2419,9 @@ async function generateSongKeyframes(
         );
         cutoutBuf = await readFile(cutoutDest);
       } else {
-        const loraName = resolveLoraName(char);
+        const loraName = resolveLoraName(char, {
+          required: kidsHit && String(char.role || "").toLowerCase() !== "mom",
+        });
         const isMom = String(char.role || "").toLowerCase() === "mom";
         // Mom LoRA trained on wrong outfit — keep VERY low for face/style only;
         // outfit lock in prompt + negatives must win over clothing priors.
@@ -2401,6 +2638,8 @@ function uniqueSlug(base, used, batchDir) {
 async function main() {
   const { flag, has } = parseArgs();
   applyCastCli(flag);
+  const songArgEarly = flag("--song", null);
+  applySessionCastFallback(songArgEarly, flag);
   const characterRoot = existsSync(CHAR_PATH)
     ? JSON.parse(stripBom(await readFile(CHAR_PATH, "utf8")))
     : {};

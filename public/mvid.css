@@ -367,6 +367,10 @@ body {
   border-radius: 10px;
   padding: 0.55rem;
   background: #121722;
+  margin-top: 1rem;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 .studio-dataset-head {
   display: flex;
@@ -391,7 +395,7 @@ body {
 }
 .studio-dataset-grid-inner {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
   gap: 0.35rem;
 }
 .studio-dataset-grid img,
@@ -431,6 +435,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .studio-dataset-tile {
+  position: relative;
   display: block;
   padding: 0;
   border: 1px solid transparent;
@@ -443,9 +448,72 @@ body {
   border-color: #c44;
   box-shadow: 0 0 0 1px rgba(200, 60, 60, 0.45);
 }
-.studio-dataset-tile.is-locked {
+.studio-dataset-tile.is-manual {
+  box-shadow: inset 0 0 0 1px rgba(40, 120, 90, 0.35);
+}
+.tile-manual-badge {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  z-index: 2;
+  margin: 0;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.58rem;
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #0d4a38;
+  background: rgba(180, 230, 200, 0.92);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.studio-pose-guide {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border, #d0d5dd);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.03);
+}
+.studio-pose-guide summary {
   cursor: pointer;
-  opacity: 0.95;
+  user-select: none;
+}
+.studio-pose-guide-list {
+  margin-top: 0.5rem;
+  display: grid;
+  gap: 0.65rem;
+}
+.studio-pose-guide-group h4 {
+  margin: 0 0 0.35rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.studio-pose-guide-row {
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 0.35rem 0.75rem;
+  padding: 0.35rem 0;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  font-size: 0.78rem;
+}
+.studio-pose-guide-row code {
+  font-size: 0.72rem;
+}
+.studio-pose-guide-row.is-present code {
+  color: #0d4a38;
+}
+.studio-pose-guide-row.is-missing code {
+  color: #8a4b00;
+}
+.studio-pose-guide-row .pose-title {
+  font-weight: 600;
+}
+.studio-pose-guide-row .pose-hint {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  margin: 0;
 }
 .studio-dataset-tile span {
   display: block;

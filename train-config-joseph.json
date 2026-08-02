@@ -1,18 +1,16 @@
 {
   "comfyUrl": "http://127.0.0.1:8888",
   "comfyRoot": "ComfyUI",
-  "datasetDir": "dataset/sasha/images",
+  "datasetDir": "dataset/joseph/images",
   "checkpoint": "realcartoon3d_v15.safetensors",
-
-  "loraName": "sashamom_character_v2",
-  "datasetFolder": "character_lora_sashamom",
-
+  "loraName": "joseph_character_v1",
+  "datasetFolder": "character_lora_joseph",
   "steps": 200,
   "learningRate": 0.0005,
   "rank": 8,
   "batchSize": 1,
   "gradAccumulationSteps": 8,
-  "seed": 888201,
+  "seed": 999301,
   "optimizer": "AdamW",
   "lossFunction": "MSE",
   "trainingDtype": "bf16",
@@ -23,7 +21,7 @@
   "offloading": false,
   "bypassMode": false,
   "existingLora": "[None]",
-
   "copyToModelsLoras": true,
-  "copyToProject": true
+  "copyToProject": true,
+  "outputName": "joseph_character_v1"
 }

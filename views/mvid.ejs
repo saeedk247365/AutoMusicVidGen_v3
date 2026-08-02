@@ -184,6 +184,7 @@
               <option value="">Select…</option>
             </select>
           </label>
+          <button type="button" class="btn tiny btn-quiet" id="btnStudioDeleteChar" title="Delete character and all dataset/LoRA files" disabled>Delete</button>
         </div>
 
         <div class="studio-body" id="studioBody" hidden>
@@ -209,70 +210,6 @@
               </div>
               <div class="studio-status" id="studioStatus"></div>
               <div class="studio-candidates" id="studioCandidates" hidden></div>
-              <div class="studio-dataset-block">
-                <div class="studio-dataset-head">
-                  <strong>Dataset</strong>
-                  <span class="meta" id="studioDatasetMeta">0 images</span>
-                </div>
-                <div class="studio-dataset-progress" id="studioDatasetProgress" hidden>
-                  <div class="studio-dataset-progress-bar"><span id="studioDatasetProgressFill"></span></div>
-                  <strong id="studioDatasetProgressText">0 / 0</strong>
-                </div>
-                <p class="meta studio-dataset-hint">Click any plate to preview as a slideshow. Remake regenerates that keyframe or shot in place. Training plates use chroma-green on purpose.</p>
-                <div class="studio-dataset-grid" id="studioDatasetGrid">
-                  <span class="meta">No training images yet</span>
-                </div>
-                <div class="dataset-lightbox" id="datasetLightbox" hidden>
-                  <div class="dataset-lightbox-backdrop" data-lightbox-close></div>
-                  <div class="dataset-lightbox-panel" role="dialog" aria-modal="true" aria-label="Dataset slideshow">
-                    <div class="dataset-lightbox-toolbar">
-                      <strong id="datasetLightboxCaption">Plate</strong>
-                      <div class="dataset-lightbox-actions">
-                        <button type="button" class="btn tiny" id="btnLightboxPrev">← Prev</button>
-                        <button type="button" class="btn tiny" id="btnLightboxNext">Next →</button>
-                        <button type="button" class="btn tiny primary" id="btnLightboxRemake">Remake</button>
-                        <button type="button" class="btn tiny" id="btnLightboxEdit" hidden>Edit prompts</button>
-                        <button type="button" class="btn tiny btn-quiet" id="btnLightboxClose" data-lightbox-close>Close</button>
-                      </div>
-                    </div>
-                    <div class="dataset-lightbox-stage">
-                      <img id="datasetLightboxImg" alt="Dataset plate" />
-                      <div class="dataset-lightbox-busy" id="datasetLightboxBusy" hidden>Remaking…</div>
-                    </div>
-                    <p class="meta" id="datasetLightboxHint"></p>
-                  </div>
-                </div>
-                <div class="shot-editor" id="shotEditor" hidden>
-                  <div class="shot-editor-top">
-                    <img id="shotEditorImg" alt="Shot preview" />
-                    <div class="shot-editor-meta">
-                      <strong id="shotEditorTitle">Shot</strong>
-                      <span class="meta" id="shotEditorFile"></span>
-                      <div class="shot-editor-actions">
-                        <button type="button" id="btnShotRegen" class="btn primary">Save + regenerate</button>
-                        <button type="button" id="btnShotSave" class="btn">Save prompts</button>
-                        <button type="button" id="btnShotEditorClose" class="btn btn-quiet">Close</button>
-                      </div>
-                    </div>
-                  </div>
-                  <p class="meta">Edits apply to this shot only (blank appearance/outfit/negative = use character defaults).</p>
-                  <label class="field">Pose <textarea id="shotPose" rows="2"></textarea></label>
-                  <label class="field">Angle text <textarea id="shotAngle" rows="2"></textarea></label>
-                  <label class="field">Caption extra <input id="shotCaptionExtra" /></label>
-                  <div class="brief-row">
-                    <label class="field">Angle key <input id="shotAngleKey" /></label>
-                    <label class="field">Pose key <input id="shotPoseKey" /></label>
-                  </div>
-                  <div class="brief-row">
-                    <label class="field">Expression <input id="shotExpression" /></label>
-                    <label class="check-row shot-bust-row"><input type="checkbox" id="shotBust" /> Bust / close-up</label>
-                  </div>
-                  <label class="field">Appearance override <textarea id="shotAppearance" rows="2" placeholder="Optional — leave blank to use character appearance"></textarea></label>
-                  <label class="field">Outfit override <textarea id="shotOutfit" rows="2" placeholder="Optional"></textarea></label>
-                  <label class="field">Negative override <textarea id="shotNegative" rows="2" placeholder="Optional"></textarea></label>
-                  <label class="field">Extra negative <textarea id="shotExtraNegative" rows="2"></textarea></label>
-                </div>
-              </div>
             </div>
 
             <div class="workshop-controls">
@@ -290,6 +227,7 @@
                   <button type="button" id="btnStudioMaster" class="btn primary">Generate master</button>
                   <button type="button" id="btnStudioApprove" class="btn" disabled>Approve</button>
                   <button type="button" id="btnStudioDataset" class="btn" disabled>Generate dataset</button>
+                  <button type="button" id="btnStudioPrepTrain" class="btn" disabled title="Copy keyframes into training images — skip Comfy inventing shots">Prepare LoRA set</button>
                   <button type="button" id="btnStudioTrain" class="btn" disabled>Train LoRA</button>
                   <button type="button" id="btnStudioSave" class="btn btn-quiet">Save prompts</button>
                 </div>
@@ -332,6 +270,82 @@
               </div>
               <label class="field">Trigger <input id="studioTrigger" /></label>
             </div>
+          </div>
+
+          <div class="studio-dataset-block">
+                <div class="studio-dataset-head">
+                  <strong>Dataset</strong>
+                  <span class="meta" id="studioDatasetMeta">0 images</span>
+                </div>
+                <div class="studio-dataset-progress" id="studioDatasetProgress" hidden>
+                  <div class="studio-dataset-progress-bar"><span id="studioDatasetProgressFill"></span></div>
+                  <strong id="studioDatasetProgressText">0 / 0</strong>
+                </div>
+                <p class="meta studio-dataset-hint">Import Gemini poses (checklist below). Prefer <strong>Prepare LoRA set</strong> over Generate dataset when your keyframes are already good — skips Comfy inventing weak gestures. Missing <code>right30</code> is fine.</p>
+                <details class="studio-pose-guide" id="studioPoseGuide">
+                  <summary><strong>Pose bank checklist</strong> — filenames for manual / Gemini upload</summary>
+                  <p class="meta" id="studioPoseGuideTip">Name files exactly as listed. <code>left_profile</code> = ~90° side view (there is no left90.png). <code>left30</code> ≈ soft turn, <code>left45</code> ≈ stronger three-quarter.</p>
+                  <div id="studioPoseGuideList" class="studio-pose-guide-list"></div>
+                </details>
+                <div class="studio-upload-actions" style="margin:0 0 0.65rem">
+                  <input type="file" id="studioPoseBankInput" accept="image/png,image/jpeg,image/webp" multiple hidden />
+                  <input type="file" id="studioKeyframeReplaceInput" accept="image/png,image/jpeg,image/webp" hidden />
+                  <button type="button" class="btn tiny" id="btnImportPoseBank">Import pose bank</button>
+                </div>
+                <div class="studio-dataset-grid" id="studioDatasetGrid">
+                  <span class="meta">No training images yet</span>
+                </div>
+                <div class="dataset-lightbox" id="datasetLightbox" hidden>
+                  <div class="dataset-lightbox-backdrop" data-lightbox-close></div>
+                  <div class="dataset-lightbox-panel" role="dialog" aria-modal="true" aria-label="Dataset slideshow">
+                    <div class="dataset-lightbox-toolbar">
+                      <strong id="datasetLightboxCaption">Plate</strong>
+                      <div class="dataset-lightbox-actions">
+                        <button type="button" class="btn tiny" id="btnLightboxPrev">← Prev</button>
+                        <button type="button" class="btn tiny" id="btnLightboxNext">Next →</button>
+                        <button type="button" class="btn tiny" id="btnLightboxReplace" hidden>Replace</button>
+                        <button type="button" class="btn tiny primary" id="btnLightboxRemake">Remake</button>
+                        <button type="button" class="btn tiny" id="btnLightboxEdit" hidden>Edit prompts</button>
+                        <button type="button" class="btn tiny btn-quiet" id="btnLightboxClose" data-lightbox-close>Close</button>
+                      </div>
+                    </div>
+                    <div class="dataset-lightbox-stage">
+                      <img id="datasetLightboxImg" alt="Dataset plate" />
+                      <div class="dataset-lightbox-busy" id="datasetLightboxBusy" hidden>Remaking…</div>
+                    </div>
+                    <p class="meta" id="datasetLightboxHint"></p>
+                  </div>
+                </div>
+                <div class="shot-editor" id="shotEditor" hidden>
+                  <div class="shot-editor-top">
+                    <img id="shotEditorImg" alt="Shot preview" />
+                    <div class="shot-editor-meta">
+                      <strong id="shotEditorTitle">Shot</strong>
+                      <span class="meta" id="shotEditorFile"></span>
+                      <div class="shot-editor-actions">
+                        <button type="button" id="btnShotRegen" class="btn primary">Save + regenerate</button>
+                        <button type="button" id="btnShotSave" class="btn">Save prompts</button>
+                        <button type="button" id="btnShotEditorClose" class="btn btn-quiet">Close</button>
+                      </div>
+                    </div>
+                  </div>
+                  <p class="meta">Edits apply to this shot only (blank appearance/outfit/negative = use character defaults).</p>
+                  <label class="field">Pose <textarea id="shotPose" rows="2"></textarea></label>
+                  <label class="field">Angle text <textarea id="shotAngle" rows="2"></textarea></label>
+                  <label class="field">Caption extra <input id="shotCaptionExtra" /></label>
+                  <div class="brief-row">
+                    <label class="field">Angle key <input id="shotAngleKey" /></label>
+                    <label class="field">Pose key <input id="shotPoseKey" /></label>
+                  </div>
+                  <div class="brief-row">
+                    <label class="field">Expression <input id="shotExpression" /></label>
+                    <label class="check-row shot-bust-row"><input type="checkbox" id="shotBust" /> Bust / close-up</label>
+                  </div>
+                  <label class="field">Appearance override <textarea id="shotAppearance" rows="2" placeholder="Optional — leave blank to use character appearance"></textarea></label>
+                  <label class="field">Outfit override <textarea id="shotOutfit" rows="2" placeholder="Optional"></textarea></label>
+                  <label class="field">Negative override <textarea id="shotNegative" rows="2" placeholder="Optional"></textarea></label>
+                  <label class="field">Extra negative <textarea id="shotExtraNegative" rows="2"></textarea></label>
+                </div>
           </div>
 
           <div class="studio-log-wrap">

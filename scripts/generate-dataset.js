@@ -13,6 +13,10 @@ import {
   checkChromaBorder,
   checkOutfitPalette,
 } from "../lib/chroma-plate.js";
+import {
+  checkYawPlausibility,
+  checkOutfitDetail,
+} from "../lib/plate-gates.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -370,9 +374,9 @@ function denoiseForEdit(shot, source, base = BASE_DENOISE) {
   else if (difficulty >= 1) d = clamp(Math.max(base * 0.95, 0.5), 0.45, 0.55);
   else d = clamp(base, 0.45, 0.52);
 
-  // Pure yaw ladder hop: keep identity by staying low
+  // Pure yaw ladder hop: keep identity by staying low (runEdit may floor to 0.55–0.58)
   if (samePose && yawDelta > 0 && yawDelta <= 35) {
-    d = clamp(Math.min(d, 0.52), 0.45, 0.55);
+    d = clamp(Math.min(d, 0.55), 0.5, 0.58);
   }
 
   // Limb / gesture edits: enough denoise to change pose, FaceID/IPAdapter anchors identity
@@ -407,6 +411,18 @@ function needsEmptyLatentRebuild(shot, source) {
   // front → strict profile (and reverse on large yaw jump)
   if (isStrictProfile(dstAngle) && !isStrictProfile(srcAngle) && yawDelta > 25) return true;
   if (isStrictProfile(srcAngle) && !isStrictProfile(dstAngle) && yawDelta > 25) return true;
+  // Hard three-quarter + soft right: EmptyLatent + FaceID.
+  // Soft left stays img2img (Massie left30 works). Soft right needs rebuild —
+  // img2img from front rarely produces a true right turn under ≤0.65 denoise.
+  if (
+    (dstAngle === "threequarter_left" ||
+      dstAngle === "threequarter_right" ||
+      dstAngle === "threequarter_soft_right") &&
+    srcAngle !== dstAngle &&
+    yawDelta >= 18
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -879,14 +895,26 @@ function characterPrompt(cfg, shot, { rebuild = false } = {}) {
 
 function shotNegative(cfg, shot) {
   const locks = identityLockParts(cfg);
+  const styleNegExtra =
+    locks.styleFamily === "flat2d"
+      ? "3d render, cgi, pixar, cocomelon 3d, plastic skin, subsurface scattering"
+      : locks.styleFamily === "kids3d"
+        ? "flat cel only, 2d anime lineart only"
+        : null;
+  const standPocketNeg =
+    effectivePoseKey(shot) === "stand" && !shot.bust
+      ? "hands in pocket, kangaroo pocket, hands tucked in hoodie"
+      : null;
   return [
     String(shot?.negative || "").trim() || cfg.negative,
     OUTFIT_NEGATIVE,
     STYLE_NEGATIVE,
+    styleNegExtra,
     ANATOMY_NEGATIVE,
     BG_CHROMA_NEGATIVE,
     locks.ageNegative,
     locks.genderNegative,
+    standPocketNeg,
     shot.extraNegative,
   ]
     .filter(Boolean)
@@ -1177,6 +1205,7 @@ function img2imgOpenPoseWorkflow(cfg, opts) {
     useIpAdapter = false,
     ipAdapterImageName = null,
     fromEmptyLatent = false,
+    skipIpOnRebuild = false,
   } = opts;
 
   const wf = withCheckpointAndOptionalLora(cfg, loraName);
@@ -1188,11 +1217,15 @@ function img2imgOpenPoseWorkflow(cfg, opts) {
       weight: w,
       weightV2: w,
     });
-  } else if (
+  }
+  // IP-Adapter only when explicitly requested (models often missing on this host).
+  const wantIp =
+    !skipIpOnRebuild &&
     useIpAdapter &&
     backend.attachMasterIpAdapter &&
-    (ipAdapterImageName || faceImageName)
-  ) {
+    (ipAdapterImageName || faceImageName) &&
+    !useFaceId;
+  if (wantIp) {
     const w = denoise >= 0.72 ? 0.65 : denoise >= 0.55 ? 0.55 : 0.45;
     backend.attachMasterIpAdapter(wf, {
       refImageName: ipAdapterImageName || faceImageName,
@@ -1303,6 +1336,21 @@ function scoreKeyframe(shot, kf) {
   // Prefer staying on the same side of the yaw ladder — never jump via strict profile/rear.
   if (isStrictProfile(dstAngle) !== isStrictProfile(srcAngle)) score += 80;
   if (isRearView(dstAngle) !== isRearView(srcAngle)) score += 70;
+
+  // Yaw ladder: only climb outward from front. Never use a more-extreme plate as
+  // source for a softer angle (left45→left30 frontalizes under low denoise).
+  const srcAbs = Math.abs(kf.yaw ?? 0);
+  const dstAbs = Math.abs(targetYaw);
+  const sameSign =
+    targetYaw === 0 ||
+    (kf.yaw ?? 0) === 0 ||
+    Math.sign(kf.yaw ?? 0) === Math.sign(targetYaw);
+  if (dstAbs > 0 && srcAbs > dstAbs + 8) score += 100;
+  if (dstAbs > 0 && !sameSign && srcAbs > 12) score += 60;
+  // Prefer the previous rung (closer to front) over jumping from front when a soft exists.
+  if (dstAbs > 0 && sameSign && srcAbs <= dstAbs && srcAbs >= dstAbs - 35) {
+    score -= 8;
+  }
 
   if (wantSmile && kf.expression === "smile") score -= 20;
   if (!wantSmile && kf.expression === "neutral") score -= 4;
@@ -1466,30 +1514,63 @@ async function checkIdentitySimilarity(candidatePath) {
 }
 
 /**
- * Multi-signal plate gate: chroma BG + outfit palette + face (when available).
- * no_face does NOT auto-pass — palette+chroma must still pass.
+ * Multi-signal plate gate: chroma BG + outfit detail + face (when appropriate) + yaw.
+ * Profile/rear: do not require InsightFace vs front master.
  */
-async function checkPlateGates(candidatePath) {
+async function checkPlateGates(candidatePath, shot = null) {
   if (SKIP_IDENTITY_GATE) {
     return { pass: true, reason: "skipped", reasons: [], face: null, chroma: null, palette: null };
   }
+  const angleKey = shot?.angleKey || "front";
   const reasons = [];
   const chroma = await checkChromaBorder(candidatePath);
   if (!chroma.pass) reasons.push(chroma.reason || "bg_not_chroma");
 
   const masterRef = existsSync(MASTER_PATH) ? MASTER_PATH : FACE_LOCK;
   let palette = null;
+  let outfitDetail = null;
   if (existsSync(masterRef)) {
-    palette = await checkOutfitPalette(candidatePath, masterRef);
-    if (!palette.pass) reasons.push(palette.reason || "outfit_drift");
+    const turned =
+      angleKey !== "front" &&
+      /threequarter|side_|back/.test(String(angleKey));
+    outfitDetail = await checkOutfitDetail(candidatePath, masterRef, {
+      // Turned shoes foreshorten / recolor vs front master — allow more slack.
+      footwearMax: turned ? 95 : 72,
+      torsoMax: turned ? 52 : 48,
+    });
+    palette = {
+      pass: outfitDetail.pass,
+      distance: outfitDetail.wholeDistance,
+      reason: outfitDetail.reason,
+    };
+    if (!outfitDetail.pass) {
+      for (const r of outfitDetail.reasons || [outfitDetail.reason]) {
+        if (r && !reasons.includes(r)) reasons.push(r);
+      }
+    }
   } else {
     reasons.push("no_master_ref");
   }
 
+  const frontRef = existsSync(join(KEYFRAMES_DIR, "front.png"))
+    ? join(KEYFRAMES_DIR, "front.png")
+    : existsSync(MASTER_PATH)
+      ? MASTER_PATH
+      : null;
+  const yaw = await checkYawPlausibility(candidatePath, angleKey, {
+    frontRef: frontRef || undefined,
+  });
+  if (!yaw.pass) reasons.push(yaw.reason || "angle_too_frontal");
+
+  const skipFaceForAngle =
+    isStrictProfile(angleKey) || isRearView(angleKey);
+
   const face = await checkIdentitySimilarity(candidatePath);
-  if (!face.skipped && !face.pass) reasons.push(face.reason || "identity_reject");
-  // Face detected and passed: good. no_face / helper missing: rely on chroma+palette only.
-  if (face.skipped && face.reason === "no_ref") reasons.push("no_face_ref");
+  if (!skipFaceForAngle) {
+    if (!face.skipped && !face.pass) reasons.push(face.reason || "identity_reject");
+    if (face.skipped && face.reason === "no_ref") reasons.push("no_face_ref");
+  }
+  // Profile/rear: face vs front master is unreliable — chroma + outfit (+ yaw) only.
 
   const pass = reasons.length === 0;
   return {
@@ -1499,7 +1580,10 @@ async function checkPlateGates(candidatePath) {
     face,
     chroma,
     palette,
+    outfitDetail,
+    yaw,
     similarity: face?.similarity ?? null,
+    skipFaceForAngle,
   };
 }
 
@@ -1544,26 +1628,100 @@ async function runEdit(cfg, ctx) {
   } = ctx;
   let denoise = ctx.denoise;
 
-  if (denoise >= 0.65 && !useFaceId && !useIpAdapter) {
+  const dstPose = effectivePoseKey(shot);
+  const yawOnlyStand =
+    dstPose === "stand" &&
+    !shot.bust &&
+    expressionOf(shot) === "neutral" &&
+    (source?.poseKey || "stand") === "stand" &&
+    !fromEmptyLatent &&
+    angularDistance(source?.yaw ?? 0, yawOf(shot.angleKey)) > 12;
+
+  // Gesture edits may keep FaceID + higher denoise; pure yaw stands stay low.
+  if (denoise >= 0.65 && !useFaceId && !useIpAdapter && !yawOnlyStand) {
     console.log(
       `  warn: denoise ${denoise.toFixed(2)} without FaceID/IP-Adapter — clamping to 0.55 for ${prefix}`,
     );
     denoise = 0.55;
   }
+  if (yawOnlyStand) {
+    // FaceID + ≤0.65 keeps identity (gesture path proved this); still below 0.72 collapse band.
+    const cap = faceUploadName ? 0.65 : 0.6;
+    denoise = Math.min(cap, Math.max(denoise, 0.55));
+    console.log(
+      `  yaw-stand lock: denoise=${denoise.toFixed(2)} openpose≥1.15 faceid=${Boolean(faceUploadName)}`,
+    );
+  }
 
-  const { poseName } = await uploadPose(cfg, shot, prefix);
-  const prompt = characterPrompt(cfg, shot, { rebuild: fromEmptyLatent });
+  const { poseName: poseName0 } = await uploadPose(cfg, shot, prefix);
+  let poseName = poseName0;
+  let rebuildAttempt = Boolean(fromEmptyLatent);
+  let prompt = characterPrompt(cfg, shot, { rebuild: rebuildAttempt });
   const negative = shotNegative(cfg, shot);
 
   const attempts = SKIP_IDENTITY_GATE ? 1 : IDENTITY_RETRIES;
   let best = null;
   let bestScore = -Infinity;
   let lastGate = null;
+  // Yaw stands: start OpenPose hot so ControlNet can beat front latent; FaceID when available.
+  let openPoseStrength = yawOnlyStand
+    ? Math.min(1.25, Math.max(OPENPOSE_STRENGTH, 1.15))
+    : OPENPOSE_STRENGTH;
+  let forceFaceId = (yawOnlyStand || rebuildAttempt) && Boolean(faceUploadName);
+  let effectiveUseFaceId = useFaceId || forceFaceId;
+  // Without FaceID, keep IP-Adapter on for yaw stands so denoise ≤0.60 stays identity-safe.
+  const forceIpAdapter =
+    yawOnlyStand && !effectiveUseFaceId && Boolean(ipAdapterUploadName || faceUploadName);
+
+  // Default skip IP on rebuild when models missing — set once after first failure.
+  let skipIpOnRebuild = false;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     const attemptSeed = (seed + attempt * 9973) >>> 0;
-    let useIp = useIpAdapter;
+    let useIp = useIpAdapter || forceIpAdapter;
     let denoiseAttempt = denoise;
+    // Angle retries: bump OpenPose on angle_too_frontal (any pose), and on yaw-stand hops.
+    if (attempt > 0) {
+      const angleFail = lastGate?.reasons?.includes("angle_too_frontal");
+      const onlyAngleFail =
+        angleFail &&
+        (lastGate?.reasons || []).every((r) => r === "angle_too_frontal");
+      // Last two attempts: EmptyLatent + FaceID/IP when soft yaw still looks frontal.
+      if (
+        onlyAngleFail &&
+        yawOnlyStand &&
+        attempt >= Math.max(1, attempts - 2) &&
+        !rebuildAttempt &&
+        (faceUploadName || ipAdapterUploadName)
+      ) {
+        rebuildAttempt = true;
+        denoiseAttempt = 1;
+        forceFaceId = Boolean(faceUploadName);
+        effectiveUseFaceId = forceFaceId || useFaceId;
+        useIp = !effectiveUseFaceId && Boolean(ipAdapterUploadName || faceUploadName);
+        prompt = characterPrompt(cfg, shot, { rebuild: true });
+        openPoseStrength = Math.min(1.25, Math.max(OPENPOSE_STRENGTH, 1.2));
+        console.log(
+          `  angle-retry LAST-RESORT EmptyLatent+${effectiveUseFaceId ? "FaceID" : "IPAdapter"} openpose=${openPoseStrength.toFixed(2)}`,
+        );
+        const reup = await uploadPose(cfg, shot, `${prefix}_a${attempt}`);
+        poseName = reup.poseName;
+      } else if (angleFail || yawOnlyStand) {
+        openPoseStrength = Math.min(1.25, Math.max(OPENPOSE_STRENGTH, 1.15) + 0.05 * attempt);
+        if (attempt >= 1 && (yawOnlyStand || angleFail) && !rebuildAttempt) {
+          // Plan: denoise +0.05 capped at 0.60 (0.65 only with FaceID).
+          const cap = faceUploadName ? 0.65 : 0.6;
+          denoiseAttempt = Math.min(cap, Math.max(denoise, 0.55) + 0.05 * attempt);
+        }
+        if (rebuildAttempt) denoiseAttempt = 1;
+        console.log(
+          `  angle-retry openpose=${openPoseStrength.toFixed(2)} denoise=${denoiseAttempt.toFixed(2)}`,
+        );
+        const reup = await uploadPose(cfg, shot, `${prefix}_a${attempt}`);
+        poseName = reup.poseName;
+      }
+    }
+
     let buf;
     try {
       buf = await queueAndWait(
@@ -1575,29 +1733,30 @@ async function runEdit(cfg, ctx) {
           prompt,
           negative,
           seed: attemptSeed,
-          denoise: denoiseAttempt,
-          openPoseStrength: OPENPOSE_STRENGTH,
+          denoise: rebuildAttempt ? 1 : denoiseAttempt,
+          openPoseStrength,
           prefix: `id_${prefix}`,
           backend,
           faceImageName: faceUploadName,
-          useFaceId,
-          useIpAdapter: useIp,
+          useFaceId: effectiveUseFaceId,
+          useIpAdapter: useIp && !effectiveUseFaceId,
           ipAdapterImageName: ipAdapterUploadName || faceUploadName,
-          fromEmptyLatent,
+          fromEmptyLatent: rebuildAttempt,
+          skipIpOnRebuild,
         }),
         attempt === 0 ? prefix : `${prefix}_r${attempt}`,
       );
     } catch (err) {
       const msg = String(err?.message || err);
-      if (useIp && /IPAdapter model not found|IPAdapterUnifiedLoader/i.test(msg)) {
+      if (/IPAdapter model not found|IPAdapterUnifiedLoader/i.test(msg)) {
         console.log(
-          "  IP-Adapter models missing — falling back to low-denoise img2img (latent identity).",
+          "  IP-Adapter models missing — falling back without IP-Adapter (FaceID/latent only).",
         );
         useIp = false;
-        denoiseAttempt = Math.min(denoiseAttempt, 0.55);
-        if (denoiseAttempt >= 0.65 && !useFaceId) {
-          denoiseAttempt = 0.55;
-        }
+        skipIpOnRebuild = true;
+        denoiseAttempt = rebuildAttempt
+          ? 1
+          : Math.min(denoiseAttempt, yawOnlyStand ? 0.6 : 0.55);
         buf = await queueAndWait(
           cfg.comfyUrl,
           img2imgOpenPoseWorkflow(cfg, {
@@ -1607,14 +1766,16 @@ async function runEdit(cfg, ctx) {
             prompt,
             negative,
             seed: attemptSeed,
-            denoise: denoiseAttempt,
-            openPoseStrength: OPENPOSE_STRENGTH,
+            denoise: rebuildAttempt ? 1 : denoiseAttempt,
+            openPoseStrength,
             prefix: `id_${prefix}`,
             backend,
             faceImageName: faceUploadName,
-            useFaceId,
+            useFaceId: effectiveUseFaceId,
             useIpAdapter: false,
-            fromEmptyLatent,
+            ipAdapterImageName: null,
+            fromEmptyLatent: rebuildAttempt,
+            skipIpOnRebuild: true,
           }),
           `${prefix}_noip_r${attempt}`,
         );
@@ -1624,7 +1785,6 @@ async function runEdit(cfg, ctx) {
     }
 
     const tmpPath = join(OUT_DIR, `_gate_${prefix.replace(/[^\w.-]+/g, "_")}.png`);
-    // Always bake solid chroma after generation so LoRA never learns rooms.
     let plateBuf = buf;
     try {
       const plate = await toChromaTrainingPlate(buf, {
@@ -1639,36 +1799,46 @@ async function runEdit(cfg, ctx) {
       console.log(`  chroma post failed: ${err.message || err}`);
     }
     await writeFile(tmpPath, plateBuf);
-    const gate = await checkPlateGates(tmpPath);
+    const gate = await checkPlateGates(tmpPath, shot);
     lastGate = gate;
 
-    const score =
-      (gate.chroma?.pass ? 2 : 0) +
-      (gate.palette?.pass ? 2 : 0) +
-      (gate.face && !gate.face.skipped && gate.face.pass ? 3 : 0) +
-      (Number(gate.similarity) || 0);
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = { buf: plateBuf, seed: attemptSeed, gate };
-    }
-
+    // Passing gate always wins (fixes pass-then-HARD-FAIL stale bestScore bug).
     if (gate.pass) {
+      best = { buf: plateBuf, seed: attemptSeed, gate };
       console.log(
         `  plate_gate=pass` +
-          (gate.similarity != null ? ` face_sim=${Number(gate.similarity).toFixed(3)}` : "") +
+          (gate.similarity != null && !gate.skipFaceForAngle
+            ? ` face_sim=${Number(gate.similarity).toFixed(3)}`
+            : "") +
           (gate.palette?.distance != null
-            ? ` paletteΔ=${gate.palette.distance.toFixed(1)}`
+            ? ` paletteΔ=${Number(gate.palette.distance).toFixed(1)}`
             : "") +
           (gate.chroma?.ratio != null
             ? ` chroma=${gate.chroma.ratio.toFixed(2)}`
+            : "") +
+          (gate.yaw?.asymmetry != null
+            ? ` yawAsym=${Number(gate.yaw.asymmetry).toFixed(3)}`
             : ""),
       );
       break;
     }
 
+    const score =
+      (gate.chroma?.pass ? 2 : 0) +
+      (gate.palette?.pass ? 2 : 0) +
+      (gate.yaw?.pass ? 1 : 0) +
+      (gate.face && !gate.face.skipped && gate.face.pass ? 3 : 0) +
+      (Number(gate.similarity) || 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = { buf: plateBuf, seed: attemptSeed, gate };
+    }
+
     console.log(
-      `  plate_gate=reject [${(gate.reasons || [gate.reason]).join(", ")}] (retry ${attempt + 1}/${attempts})`,
+      `  plate_gate=reject [${(gate.reasons || [gate.reason]).join(", ")}] (retry ${attempt + 1}/${attempts})` +
+        (gate.yaw?.asymmetry != null
+          ? ` yawAsym=${Number(gate.yaw.asymmetry).toFixed(3)}`
+          : ""),
     );
   }
 
@@ -1679,9 +1849,17 @@ async function runEdit(cfg, ctx) {
     } catch {
       /* ignore */
     }
-    const why = (best.gate.reasons || [best.gate.reason || "gate_failed"]).join(", ");
+    const whyLatest = (lastGate?.reasons || [lastGate?.reason]).filter(Boolean);
+    const whyBest = (best.gate.reasons || [best.gate.reason || "gate_failed"]).filter(Boolean);
+    const why =
+      whyLatest.length > 0
+        ? whyLatest.join(", ")
+        : whyBest.join(", ");
     throw new Error(
-      `plate_gate HARD FAIL for ${prefix}: ${why} after ${attempts} tries (not writing)`,
+      `plate_gate HARD FAIL for ${prefix}: ${why} after ${attempts} tries (not writing)` +
+        (whyBest.length && whyBest.join(",") !== why
+          ? ` [best-attempt had: ${whyBest.join(", ")}]`
+          : ""),
     );
   }
 
@@ -1737,6 +1915,7 @@ async function loadKeyframeBank(cfg) {
 function keyframeShotFromSpec(spec) {
   const expr = String(spec.expression || "neutral").toLowerCase();
   let pose = "standing straight, arms relaxed at sides, feet slightly apart";
+  let extraNegative = "";
   if (spec.poseKey === "sit") pose = "sitting, knees bent, hands on thighs, feet on floor";
   else if (spec.poseKey === "crawl") pose = "crawling on all fours, hands and knees on floor";
   else if (spec.poseKey === "walk") pose = "walking mid-stride, arms swinging naturally";
@@ -1745,11 +1924,19 @@ function keyframeShotFromSpec(spec) {
   else if (spec.poseKey === "point") pose = "standing, one arm extended pointing forward";
   else if (spec.bust) pose = "facing camera, shoulders visible";
   else if (expr === "happy" || expr === "smile") {
-    pose = "standing straight, soft friendly closed-mouth smile, arms at sides";
+    pose = "standing straight, soft friendly closed-mouth smile, arms relaxed at sides";
   }
   if (expr === "sad" && spec.bust) pose = "sad expression, downturned mouth, shoulders visible";
   if (expr === "surprised" && spec.bust) pose = "surprised expression, wide eyes, shoulders visible";
   if (expr === "happy" && spec.bust) pose = "happy smile, rosy cheeks, shoulders visible";
+
+  // Angle-bank stands: never invent kangaroo-pocket poses that fight OpenPose.
+  if ((spec.poseKey || "stand") === "stand" && !spec.bust) {
+    pose =
+      "standing straight, arms relaxed at sides, hands visible near hips, feet slightly apart, no hands in pockets";
+    extraNegative =
+      "hands in pocket, kangaroo pocket, hands tucked in hoodie, fists in pocket, arms crossed";
+  }
 
   return normalizeShot({
     id: spec.id,
@@ -1759,6 +1946,7 @@ function keyframeShotFromSpec(spec) {
     bust: Boolean(spec.bust),
     pose,
     captionExtra: spec.caption,
+    extraNegative: extraNegative || undefined,
   });
 }
 
@@ -2077,6 +2265,9 @@ async function main() {
       throw new Error("front keyframe missing");
     }
 
+    /** @type {{ id: string, error: string }[]} */
+    const keyframeFailures = [];
+
     for (const spec of keyframeSpecsFor(cfg)) {
       if (spec.id === "front") continue;
       if (ONLY_IDS && !ONLY_IDS.has(spec.id)) continue;
@@ -2088,8 +2279,23 @@ async function main() {
       }
 
       const shot = keyframeShotFromSpec(spec);
-      // Never img2img from the plate we're replacing (force remake would lock drift).
-      const bankForSource = keyframeBank.filter((k) => k.id !== spec.id);
+      // Never img2img from the plate we're replacing; also skip sources that fail their own yaw gate.
+      let bankForSource = keyframeBank.filter((k) => k.id !== spec.id);
+      const gatedBank = [];
+      for (const kf of bankForSource) {
+        if (!kf.path || kf.id === "front" || kf.angleKey === "front") {
+          gatedBank.push(kf);
+          continue;
+        }
+        try {
+          const y = await checkYawPlausibility(kf.path, kf.angleKey);
+          if (y.pass) gatedBank.push(kf);
+          else console.log(`  skip source ${kf.id} (yaw gate: ${y.reason})`);
+        } catch {
+          gatedBank.push(kf);
+        }
+      }
+      if (gatedBank.length) bankForSource = gatedBank;
       const { source, reason } = selectSource(shot, bankForSource, null);
       let rebuild = needsEmptyLatentRebuild(shot, source);
       let denoise = rebuild ? 1 : denoiseForEdit(shot, source);
@@ -2108,29 +2314,52 @@ async function main() {
         `  ${spec.id} ← ${reason} (${rebuild ? "REBUILD EmptyLatent" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId} ipadapter=${useIpAdapter})`,
       );
 
-      await runEdit(cfg, {
-        shot,
-        source,
-        denoise,
-        seed: cfg.seed + 100 + keyframeBank.length * 13,
-        prefix: `kf_${spec.id}`,
-        outPath,
-        captionPath: null,
-        loraName,
-        backend,
-        faceUploadName,
-        ipAdapterUploadName,
-        fromEmptyLatent: rebuild,
-        useFaceId,
-        useIpAdapter,
-      });
-
-      console.log(`  ✓ ${outPath}`);
-      keyframeBank = await loadKeyframeBank(cfg);
+      try {
+        await runEdit(cfg, {
+          shot,
+          source,
+          denoise,
+          seed: cfg.seed + 100 + keyframeBank.length * 13,
+          prefix: `kf_${spec.id}`,
+          outPath,
+          captionPath: null,
+          loraName,
+          backend,
+          faceUploadName,
+          ipAdapterUploadName,
+          fromEmptyLatent: rebuild,
+          useFaceId,
+          useIpAdapter,
+        });
+        console.log(`  ✓ ${outPath}`);
+        keyframeBank = await loadKeyframeBank(cfg);
+      } catch (err) {
+        const msg = String(err?.message || err);
+        console.log(`  ✗ skip ${spec.id}: ${msg}`);
+        console.log(
+          `    → Import manually as ${spec.id}.png (Gemini) or Remake later; continuing bank…`,
+        );
+        keyframeFailures.push({ id: spec.id, error: msg });
+      }
     }
 
     keyframeBank = await loadKeyframeBank(cfg);
     console.log(`  Keyframe bank ready (${keyframeBank.length} frames).`);
+    if (keyframeFailures.length) {
+      console.log(`\n  ${keyframeFailures.length} keyframe(s) skipped (import or Remake):`);
+      for (const f of keyframeFailures) {
+        console.log(`    - ${f.id}.png`);
+      }
+      console.log(
+        "  Tip: left30≈30° turn, left45≈45° turn, left_profile≈90° side (not left90.png).",
+      );
+      // Targeted remake (--only) must still fail the job so the UI shows an error.
+      if (ONLY_IDS) {
+        throw new Error(
+          `plate_gate HARD FAIL for: ${keyframeFailures.map((f) => f.id).join(", ")}`,
+        );
+      }
+    }
   } else {
     console.log("\n[2] Loading keyframe bank");
     keyframeBank = await loadKeyframeBank(cfg);
@@ -2179,6 +2408,68 @@ async function main() {
       continue;
     }
 
+    // Identical front stand → byte-copy front keyframe (do not rewrite identity).
+    const isFrontClone =
+      (shot.angleKey || "front") === "front" &&
+      effectivePoseKey(shot) === "stand" &&
+      expressionOf(shot) === "neutral" &&
+      !shot.bust;
+    const frontKf = join(KEYFRAMES_DIR, "front.png");
+    if (isFrontClone && existsSync(frontKf)) {
+      await copyFile(frontKf, imgPath);
+      await writeFile(txtPath, captionFor(cfg, shot), "utf8");
+      const up = await uploadImage(cfg.comfyUrl, `id_out_${shot.id}.png`, await readFile(imgPath));
+      lastAccepted = {
+        id: shot.id,
+        shotId: shot.id,
+        uploadName: up.name,
+        yaw: 0,
+        angleKey: "front",
+        poseKey: "stand",
+        expression: "neutral",
+        bust: false,
+      };
+      console.log(`  (${i + 1}/${shots.length}) ${shot.id} ← copy front.png`);
+      manifest.push({ id: shot.id, source: "copy:front", denoise: 0 });
+      continue;
+    }
+
+    // Same angle+pose+expression as an existing keyframe → byte-copy
+    // (e.g. left_profile → 02_side_stand). Re-img2img often ruins profiles.
+    const cloneKf = keyframeBank.find(
+      (kf) =>
+        kf.path &&
+        existsSync(kf.path) &&
+        (kf.angleKey || "front") === (shot.angleKey || "front") &&
+        (kf.poseKey || "stand") === effectivePoseKey(shot) &&
+        (kf.expression || "neutral") === expressionOf(shot) &&
+        Boolean(kf.bust) === Boolean(shot.bust),
+    );
+    if (cloneKf) {
+      await copyFile(cloneKf.path, imgPath);
+      await writeFile(txtPath, captionFor(cfg, shot), "utf8");
+      const up = await uploadImage(
+        cfg.comfyUrl,
+        `id_out_${shot.id}.png`,
+        await readFile(imgPath),
+      );
+      lastAccepted = {
+        id: shot.id,
+        shotId: shot.id,
+        uploadName: up.name,
+        yaw: yawOf(shot.angleKey),
+        angleKey: shot.angleKey || "front",
+        poseKey: effectivePoseKey(shot),
+        expression: expressionOf(shot),
+        bust: Boolean(shot.bust),
+      };
+      console.log(
+        `  (${i + 1}/${shots.length}) ${shot.id} ← copy keyframe:${cloneKf.id}.png`,
+      );
+      manifest.push({ id: shot.id, source: `copy:${cloneKf.id}`, denoise: 0 });
+      continue;
+    }
+
     const { source, reason } = selectSource(shot, keyframeBank, lastAccepted);
     let rebuild = needsEmptyLatentRebuild(shot, source);
     let denoise = rebuild ? 1 : denoiseForEdit(shot, source);
@@ -2196,45 +2487,61 @@ async function main() {
       `  (${i + 1}/${shots.length}) ${shot.id} ← ${reason} (${rebuild ? "REBUILD" : "img2img"} denoise=${denoise.toFixed(2)} faceid=${useFaceId} ipadapter=${useIpAdapter})`,
     );
 
-    const result = await runEdit(cfg, {
-      shot,
-      source,
-      denoise,
-      seed: cfg.seed + 500 + i * 17,
-      prefix: shot.id,
-      outPath: imgPath,
-      captionPath: txtPath,
-      loraName,
-      backend,
-      faceUploadName,
-      ipAdapterUploadName,
-      fromEmptyLatent: rebuild,
-      useFaceId,
-      useIpAdapter,
-    });
+    try {
+      const result = await runEdit(cfg, {
+        shot,
+        source,
+        denoise,
+        seed: cfg.seed + 500 + i * 17,
+        prefix: shot.id,
+        outPath: imgPath,
+        captionPath: txtPath,
+        loraName,
+        backend,
+        faceUploadName,
+        ipAdapterUploadName,
+        fromEmptyLatent: rebuild,
+        useFaceId,
+        useIpAdapter,
+      });
 
-    lastAccepted = result;
+      lastAccepted = result;
 
-    // Keyframe refresh only when --keyframe-refresh (opt-in; avoids bank pollution)
-    const refreshKf = findRefreshTarget(shot, keyframeBank);
-    if (refreshKf) {
-      await refreshKeyframe(refreshKf, result.buf, cfg, shot);
+      // Keyframe refresh only when --keyframe-refresh (opt-in; avoids bank pollution)
+      const refreshKf = findRefreshTarget(shot, keyframeBank);
+      if (refreshKf) {
+        await refreshKeyframe(refreshKf, result.buf, cfg, shot);
+      }
+
+      manifest.push({
+        id: shot.id,
+        source: reason,
+        denoise: rebuild ? 1 : denoise,
+        rebuild,
+        faceId: useFaceId,
+        sourceYaw: source.yaw,
+        targetYaw: yawOf(shot.angleKey),
+        refreshedKeyframe: refreshKf ? refreshKf.id : null,
+        identityGate: result.identityGate || null,
+        seedUsed: result.seedUsed ?? null,
+      });
+      console.log(`  ✓ ${imgPath}`);
+      if (shouldOpenImages(cfg)) openFile(imgPath);
+    } catch (err) {
+      const msg = String(err?.message || err);
+      console.log(`  ✗ skip ${shot.id}: ${msg}`);
+      console.log(
+        `    → Fix matching keyframe or Remake this shot later; continuing…`,
+      );
+      manifest.push({ id: shot.id, skipped: true, error: msg });
+      if (ONLY_IDS) throw err;
     }
+  }
 
-    manifest.push({
-      id: shot.id,
-      source: reason,
-      denoise: rebuild ? 1 : denoise,
-      rebuild,
-      faceId: useFaceId,
-      sourceYaw: source.yaw,
-      targetYaw: yawOf(shot.angleKey),
-      refreshedKeyframe: refreshKf ? refreshKf.id : null,
-      identityGate: result.identityGate || null,
-      seedUsed: result.seedUsed ?? null,
-    });
-    console.log(`  ? ${imgPath}`);
-    if (shouldOpenImages(cfg)) openFile(imgPath);
+  const skippedShots = manifest.filter((m) => m.skipped);
+  if (skippedShots.length) {
+    console.log(`\n  ${skippedShots.length} training shot(s) skipped:`);
+    for (const s of skippedShots) console.log(`    - ${s.id}`);
   }
 
   const masterDs = join(IMAGES_DIR, `${cfg.trigger}_00_master_identity.png`);
